@@ -15,8 +15,7 @@
 | Linux 系统 | epoll/signalfd/timerfd、非阻塞 socket、Unix socket、写线程 + 有界 ring、二进制日志、HTTP/SSE | M4 P0、M5、M6 soak |
 | 工程化 | 共享纯 C 协议、fuzz、ctest/ASan、台架工具、文档单一事实源 | M3.0、M4 CI |
 
-非目标：CAN FD（S3 不支持）、多通道、多设备集群、云端。主机以 CLI 为主，
-Web dashboard 仅作可视化层：无前端框架、无构建步骤，页面由 daemon 直接托管。
+非目标：CAN FD（S3 不支持）、多通道、多设备集群、云端；Web 仅作可视化层（单文件、无框架/构建）。
 
 ## 2. 仓库与数据流
 
@@ -32,19 +31,16 @@ Web dashboard 仅作可视化层：无前端框架、无构建步骤，页面由
 CAN ── 收发器 ── ESP32-S3
                   ├─ twai_task → PSRAM ring → net_task ─Wi-Fi/TCP→ linsightd → .lsc
                   │            └→ 捕获侧 512 条 UI history → LVGL 20 Hz
-                  └─ 触摸 / GPIO0
-                                      linsightd ── Unix socket / TCP → linsight-cli
-                                                └─ HTTP + SSE → 浏览器 dashboard
+                  └─ 触摸 / GPIO0        linsightd ─ Unix/TCP → CLI · HTTP/SSE → 浏览器
 ```
 
 ring（约 52k 条）供网络排空，UI history 独立；主机追数据时 trace 不会被抽空。
 
 ## 3. 现状与缺陷
 
-M0–M2 已跑通：采集/UI/流式/CONTROL-ACK/daemon/CLI/`.lsc`/导出。ESP32 自测
-30000 帧启动突发 4330 fps、96% 负载零丢失（未触发 ring 溢出）；外部 PCAN 经
-WSL2 SocketCAN 50 fps/10 s、1000 fps/10 s 零丢帧；主机 ctest 7/7、ASan/UBSan 通过，
-集成测试覆盖 daemon→CLI/`.lsc` 与 HTTP 页面、SSE、Web 控制。
+M0–M2 已跑通：采集/UI/流式/CONTROL-ACK/daemon/CLI/`.lsc`/导出。ESP32 自测 30000 帧
+启动突发 4330 fps、96% 负载零丢失（未触发 ring 溢出）；外部 PCAN 经 WSL2 50/1000 fps
+各 10 s 零丢帧；主机 ctest 7/7、ASan/UBSan 通过，集成测试覆盖 CLI、`.lsc`、HTTP/SSE 与 Web 控制。
 
 | 缺陷 | 影响 | 修复 |
 |---|---|---|
@@ -54,9 +50,8 @@ WSL2 SocketCAN 50 fps/10 s、1000 fps/10 s 零丢帧；主机 ctest 7/7、ASan/U
 | `twai` restart/recover 无互斥 | 并发重启、paused 丢失、状态提前提交 | 重启锁；成功后才提交 bitrate/mode/state；保留 paused |
 | PCAN 假活无检测 | 高速灌帧后必须拔插 USB | 速率建议、单帧探测、stats 新鲜度、失败锁存 |
 
-M4 P0 已实现：`config` ACK、`replay`（40 帧 p99 0.30 ms）、`compare`、`.lsc` 魔数/
-版本校验、ASan/UBSan + CI。待修：epoll 循环内阻塞 `send_all`、writer 丢帧计数未上报、
-ASC 格式需 can-utils 对照。
+M4 P0 已实现：`config` ACK、`replay`（40 帧 p99 0.30 ms）、`compare`、`.lsc` 校验、ASan/UBSan + CI。
+待修：epoll 循环内阻塞 `send_all`、writer 丢帧计数未上报、ASC 格式需 can-utils 对照。
 
 PCAN “假活”的复现与恢复见 [hardware.md](hardware.md) §5。
 
@@ -80,8 +75,7 @@ P0（已实现，见 `~/linsight/host`）：
 - `linsight-cli config`：只发显式字段，等待 ACK；非法值显示 `BAD_ARG`。
 - `replay`：AF_CAN/CAN_RAW + `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`，p99 误差 <5 ms。
 - `compare`：按 `(id, flags, dlc, data)` FIFO 匹配，报告 missing/duplicate/order；不做跨设备延迟分位。
-- `.lsc` 魔数 + 版本校验；ASan/UBSan + ctest 接入 CI。
-- 删除 `.lsc` 随机索引（顺序回放不需要）。
+- `.lsc` 魔数 + 版本校验；ASan/UBSan + ctest 接入 CI；删除随机索引（顺序回放不需要）。
 
 P1（待做）：systemd/journald/logrotate、DBC（cantools）；物理 PCAN 的 SocketCAN 对照已打通
 （usbipd + `peak_usb` + `can0`，50/1000 fps 零丢帧；3500 fps 待亚毫秒节拍）。
@@ -91,13 +85,10 @@ P1（待做）：systemd/journald/logrotate、DBC（cantools）；物理 PCAN �
 CLI：`live` 过滤/着色、`stats --watch` 周期刷新、`export` 时间与 ID 过滤；全部通过
 Unix socket / `--ctl-port` 复用 daemon。验收：1 h 连续 `live` 不卡；3000 帧/s 可抽样核对。
 
-Web：`src/http.c` 在 daemon 的**同一个 epoll 循环**里提供最小 HTTP/1.1 + SSE，
-无第三方库；`host/web/index.html` 单文件（内联 CSS/JS、无构建）展示统计 tile、
-实时帧表、fps/负载 sparkline、Top IDs 与 pause/resume/clear/config 控制。
-`/api/live` 每事件 ≤64 条记录；发送非阻塞，浏览器慢时丢事件而不阻塞采集。
-`/api/control` 只做白名单转发，不等设备 ACK（下一帧 STATS 反映结果）。
-验收：页面 200 且含标题；`/api/stats` 透传设备 JSON（含 `load_permille`）；
-SSE 收到含真实记录的 JSON 数组；暂停/恢复经 CONTROL-ACK 生效；集成测试覆盖以上路径。
+Web：`src/http.c` 在同一 epoll 循环提供最小 HTTP/1.1 + SSE（无第三方库）；
+`host/web/index.html` 单文件展示统计 tile、实时帧表、fps/负载曲线、Top IDs 与控制。
+SSE 每事件 ≤64 条、发送非阻塞（慢浏览器丢事件）；`/api/control` 白名单转发不等 ACK。
+验收：页面、`/api/stats`（含 `load_permille`）、SSE、暂停/恢复均由集成测试覆盖。
 
 ## 7. M6 Soak 与交付
 
@@ -113,9 +104,8 @@ SSE 收到含真实记录的 JSON 数组；暂停/恢复经 CONTROL-ACK 生效�
   `cd ~/linsight/host && cmake -S . -B build && cmake --build build -j"$(nproc)"`。
 - 本仓库只提交固件；上位机在 `~/linsight` 单独提交；`protocol/`、`docs/` 改动两边同步。
 - 台架用 WSL `can0`（见 [hardware.md](hardware.md) §5）；Python 台架工具留在上位机仓。
-- 文档只放 `docs/`；协议以 `protocol/frame.h` 为准，不复制表格。
 - 台架 Wi-Fi/主机地址集中在 `main/net.c` 的 `BENCH_*` 宏（只重编一个文件，已提交）；生产部署改回 menuconfig/私密配置。Wi-Fi 使用 CN 1–13 信道。
-- 不提交 `build/`、`sdkconfig`、`managed_components/`；提交信息用中文。
+- 不提交 `build/`、`sdkconfig`、`managed_components/`；文档只放 `docs/`；提交信息用中文。
 
 ## 9. 风险与简历
 
