@@ -95,3 +95,10 @@ build/linsight-cli stats --watch
 
 For counter-checked soaks use `../tools/can_soak.py` (AF_CAN generator, 32-bit
 payload counter) and compare the captured `.lsc` against the send sequence.
+`../tools/soak24h.py` wraps a private daemon, the generator, one-minute health
+samples and per-part verification into one long run:
+
+```bash
+python3 ../tools/soak24h.py --duration 86400 --rate 800
+# report: ~/can-logs/soak-latest/summary.txt; stop via soak-latest/wrapper.pid
+```

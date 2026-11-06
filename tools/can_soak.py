@@ -115,16 +115,16 @@ def verify(args):
     if args.expect is not None and n != args.expect:
         print(f"FAIL: records={n} expected={args.expect}", file=sys.stderr)
         return 1
-    want = 0
+    want = args.first
     bad = 0
     for i in range(n):
         seq, ts, ident, flags, dlc, data = LSC_REC.unpack_from(
             blob, LSC_HEADER + i * LSC_REC.size)
+        if args.id is not None and ident != args.id:
+            continue
         if dlc != 8:
             print(f"FAIL: record {i} dlc={dlc}", file=sys.stderr)
             return 1
-        if args.id is not None and ident != args.id:
-            continue
         got = int.from_bytes(data[:4], "little")
         if got != want:
             if bad < 10:
@@ -135,7 +135,8 @@ def verify(args):
     if bad:
         print(f"FAIL: {bad} counter mismatches in {n} records", file=sys.stderr)
         return 1
-    print(f"verify: {n} records, counters 0..{want - 1}, no gaps/duplicates")
+    print(f"verify: {n} records, counters {args.first}..{want - 1}, "
+          f"no gaps/duplicates")
     return 0
 
 
@@ -150,6 +151,8 @@ def main():
     p.add_argument("--record", help="write accepted sends as CSV")
     p.add_argument("--verify", metavar="LSC", help="verify a captured .lsc instead")
     p.add_argument("--expect", type=int, help="expected record count for --verify")
+    p.add_argument("--first", type=int, default=0,
+                   help="first counter value for --verify (default 0)")
     args = p.parse_args()
     if args.rate <= 0:
         p.error("--rate must be > 0")

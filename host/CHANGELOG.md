@@ -9,7 +9,9 @@
   rules for binaries, page and the prefix's `etc/default/linsightd`.
 - `linsight-cli decode` for DBC files (Intel/Motorola, signed, factor/offset;
   conditional multiplexed signals skipped) with a unit test.
-- Counter-checked SocketCAN soak tool (`tools/can_soak.py`) with `.lsc` verifier.
+- Counter-checked SocketCAN soak tool (`tools/can_soak.py`) with `.lsc` verifier,
+  and `tools/soak24h.py` for unattended runs with health samples and per-part
+  verification.
 - 10.9-minute bench, 600k counter-checked frames (~917 fps; PCAN-USB over
   usbip is limited to about 1 ms per frame): device/host zero drops and
   continuous per-frame counters.

@@ -18,6 +18,7 @@ Layout:
 - `firmware/can_ring.c/h` — read-only copy of the firmware ring for `test_ring`
 - `tools/bench_can.py` — optional python-can bench tool; `cangen` is the primary bench
 - `tools/can_soak.py` — AF_CAN 32-bit-counter generator + `.lsc` verifier
+- `tools/soak24h.py` — self-contained daemon + generator + health samples + report
 - `docs/` — project docs mirrored from the firmware repo
 
 ## Commands
@@ -43,6 +44,7 @@ build/linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]
 sudo cmake --install build        # binaries + web + unit + prefix etc/default
 python3 ../tools/can_soak.py --iface can0 --rate 1000 --duration 600 --record /tmp/tx.csv
 python3 ../tools/can_soak.py --verify FILE.lsc --expect 600000
+python3 ../tools/soak24h.py --duration 86400 --rate 800   # report in ~/can-logs/soak-latest
 ```
 
 Dashboard: `http://127.0.0.1:8080/` (Windows browser via WSL localhost forwarding);
