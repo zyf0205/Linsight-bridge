@@ -79,7 +79,7 @@ P0（已实现，见 `~/linsight/host`）：
 - `compare`：按 `(id, flags, dlc, data)` FIFO 匹配，报告 missing/duplicate/order；不做跨设备延迟分位。
 - `.lsc` 魔数 + 版本校验；ASan/UBSan + ctest 接入 CI；删除随机索引（顺序回放不需要）。
 
-P1：systemd（`DynamicUser` + journald）与 daemon 侧 `--log-max-mb` 分卷已实现；DBC 待做。
+P1：systemd（`DynamicUser` + journald）、`--log-max-mb` 分卷与 DBC 基础解码（非复用信号）已实现。
 物理 PCAN 的 SocketCAN 对照已打通（usbipd + `peak_usb` + `can0`，50–917 fps 零丢帧；更高节拍受适配器 ~1 ms/帧限制）。
 
 ## 6. M5 CLI 深化与 Web 可视化

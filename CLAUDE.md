@@ -9,11 +9,11 @@ ctest suite. The ESP32-S3 firmware, Wi-Fi credentials, and flashing live in the 
 Windows checkout `D:\_study\projects\_MyProject\LinSight`; this repo does not build firmware.
 
 Layout:
-- `host/src/` — daemon, `.lsc` writer/reader, replay, compare, device session, HTTP/SSE
-- `host/cli/` — stats/live/config/pause/resume/clear/export/replay/compare
+- `host/src/` — daemon, `.lsc` writer/reader, replay, compare, DBC, device session, HTTP/SSE
+- `host/cli/` — stats/live/config/pause/resume/clear/export/replay/compare/decode
 - `host/web/index.html` — single-file dashboard (served by `linsightd`, no build step)
 - `host/systemd/` — service unit + `/etc/default` args (CMake `install` targets)
-- `host/tests/` — record/parser/fuzz/ring/canlog/compare/integration/rotation
+- `host/tests/` — record/parser/fuzz/ring/canlog/compare/dbc/integration/rotation
 - `protocol/` — shared v2.0 parser (mirror of the firmware repo)
 - `firmware/can_ring.c/h` — read-only copy of the firmware ring for `test_ring`
 - `tools/bench_can.py` — optional python-can bench tool; `cangen` is the primary bench
@@ -38,8 +38,9 @@ build/linsight-cli export candump FILE.lsc [-o OUT] [--id ID] [--ext|--std]
                                      [--from EPOCH] [--to EPOCH]
 build/linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]
 build/linsight-cli compare REF.lsc CAND.lsc
+build/linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]
 
-sudo cmake --install build        # binaries + web + systemd unit + /etc/default
+sudo cmake --install build        # binaries + web + unit + prefix etc/default
 python3 ../tools/can_soak.py --iface can0 --rate 1000 --duration 600 --record /tmp/tx.csv
 python3 ../tools/can_soak.py --verify FILE.lsc --expect 600000
 ```
@@ -85,6 +86,8 @@ cangen can0 -n 500 -g 20 -I 0x123 -L 8   # 50 fps x 10 s; device total is ground
   is on the same bus — replay in a quiet bus or account for the extra records.
 - `compare` matches FIFO per `(id, flags, dlc, data)` and reports missing/extra/order;
   it is offline, so there are no cross-device latency statistics.
+- `decode` parses `BO_`/`SG_` (Intel/Motorola, signed, factor/offset); conditional
+  `mN` signals are skipped, `--limit 0` prints all matches.
 - `protocol/frame.c` is pure C (no IDF, no malloc); keep it allocation-free and fuzzable.
 - Single device TCP client; the daemon is the only writer to `.lsc`.
 - On reconnect the device drains its PSRAM ring backlog first (up to ~52k records).

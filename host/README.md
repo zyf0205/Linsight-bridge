@@ -48,10 +48,13 @@ build/linsight-cli export candump FILE.lsc [-o OUT] [--id ID] [--ext|--std]
                                      [--from EPOCH] [--to EPOCH]
 build/linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]
 build/linsight-cli compare REF.lsc CAND.lsc
+build/linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]
 ```
 
 `config` exits 0 on ACK OK, 2 on `BAD_ARG`, 3 on `FAILED`; `compare` exits 1
-when missing/extra/order counts are non-zero.
+when missing/extra/order counts are non-zero. `decode` supports Intel/Motorola
+signals with signedness, factor and offset; conditional `mN` multiplexed
+signals are skipped and `--limit 0` prints every matching frame.
 
 ## HTTP API
 

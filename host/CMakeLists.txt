@@ -28,6 +28,7 @@ add_executable(linsight-cli
     cli/cli.c
     src/canlog.c
     src/compare.c
+    src/dbc.c
     src/replay.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
 target_include_directories(linsight-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -50,12 +51,15 @@ target_include_directories(test_canlog PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_executable(test_compare tests/test_compare.c src/canlog.c src/compare.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
 target_include_directories(test_compare PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_executable(test_dbc tests/test_dbc.c src/dbc.c)
+target_include_directories(test_dbc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME record COMMAND test_record)
 add_test(NAME parser COMMAND test_parser)
 add_test(NAME fuzz COMMAND test_fuzz)
 add_test(NAME ring COMMAND test_ring)
 add_test(NAME canlog COMMAND test_canlog)
 add_test(NAME compare COMMAND test_compare)
+add_test(NAME dbc COMMAND test_dbc)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)

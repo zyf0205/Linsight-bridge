@@ -6,7 +6,9 @@
   (single-file `web/index.html`, no framework or build step).
 - `--log-max-mb` size-based `.lsc` rotation with continuous timestamps.
 - systemd unit (`DynamicUser`, `StateDirectory`, journald) and CMake install
-  rules for binaries, page and `/etc/default/linsightd`.
+  rules for binaries, page and the prefix's `etc/default/linsightd`.
+- `linsight-cli decode` for DBC files (Intel/Motorola, signed, factor/offset;
+  conditional multiplexed signals skipped) with a unit test.
 - Counter-checked SocketCAN soak tool (`tools/can_soak.py`) with `.lsc` verifier.
 - 10.9-minute bench, 600k counter-checked frames (~917 fps; PCAN-USB over
   usbip is limited to about 1 ms per frame): device/host zero drops and
