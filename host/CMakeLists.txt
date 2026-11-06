@@ -7,6 +7,12 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 add_compile_options(-Wall -Wextra)
 
+option(LINSIGHT_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+if(LINSIGHT_SANITIZE)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../protocol)
 
 # linsightd: epoll daemon, .lsc writer thread, Unix-socket control
@@ -20,8 +26,11 @@ target_link_libraries(linsightd pthread rt)
 add_executable(linsight-cli
     cli/cli.c
     src/canlog.c
+    src/compare.c
+    src/replay.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
 target_include_directories(linsight-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(linsight-cli rt)
 
 enable_testing()
 add_executable(test_record tests/test_record.c ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
@@ -34,10 +43,18 @@ add_executable(test_ring tests/test_ring.c
 target_include_directories(test_ring PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/shims
     ${CMAKE_CURRENT_SOURCE_DIR}/../firmware)
+add_executable(test_canlog tests/test_canlog.c src/canlog.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
+target_include_directories(test_canlog PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_executable(test_compare tests/test_compare.c src/canlog.c src/compare.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
+target_include_directories(test_compare PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME record COMMAND test_record)
 add_test(NAME parser COMMAND test_parser)
 add_test(NAME fuzz COMMAND test_fuzz)
 add_test(NAME ring COMMAND test_ring)
+add_test(NAME canlog COMMAND test_canlog)
+add_test(NAME compare COMMAND test_compare)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)

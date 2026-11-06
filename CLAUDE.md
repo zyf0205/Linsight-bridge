@@ -9,9 +9,9 @@ ctest suite. The ESP32-S3 firmware, Wi-Fi credentials, and flashing live in the 
 Windows checkout `D:\_study\projects\_MyProject\LinSight`; this repo does not build firmware.
 
 Layout:
-- `host/src/` — daemon, `.lsc` writer, device session
-- `host/cli/` — stats/live/pause/resume/clear/export
-- `host/tests/` — record/parser/fuzz/ring/integration
+- `host/src/` — daemon, `.lsc` writer/reader, replay, compare, device session
+- `host/cli/` — stats/live/config/pause/resume/clear/export/replay/compare
+- `host/tests/` — record/parser/fuzz/ring/canlog/compare/integration
 - `protocol/` — shared v2.0 parser (mirror of the firmware repo)
 - `firmware/can_ring.c/h` — read-only copy of the firmware ring for `test_ring`
 - `tools/bench_can.py` — optional python-can bench tool; `cangen` is the primary bench
@@ -23,9 +23,21 @@ Layout:
 cd ~/linsight/host
 cmake -S . -B build && cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
+cmake -S . -B build-asan -DLINSIGHT_SANITIZE=ON   # ASan/UBSan build
+
 build/linsightd --port 8888 --ctl-port 8889 --log-dir ~/can-logs
-build/linsight-cli stats|live|pause|resume|clear|export asc|candump FILE.lsc
+build/linsight-cli stats [--watch] [--interval MS]
+build/linsight-cli live [--id 0x123] [--ext|--std] [--color]
+build/linsight-cli config --bitrate 500000 --mode normal
+build/linsight-cli pause|resume|clear
+build/linsight-cli export candump FILE.lsc [-o OUT] [--id ID] [--ext|--std]
+                                     [--from EPOCH] [--to EPOCH]
+build/linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]
+build/linsight-cli compare REF.lsc CAND.lsc
 ```
+
+`config` exits 0 on ACK OK, 2 on BAD_ARG, 3 on FAILED. `compare` exits 1 when
+missing/extra/order are non-zero.
 
 Bench (PCAN via usbipd; the Windows GUI is legacy/removed):
 ```bash
@@ -42,7 +54,16 @@ cangen can0 -n 500 -g 20 -I 0x123 -L 8   # 50 fps x 10 s; device total is ground
   `/tmp/linsight.sock` for the CLI, optional loopback `--ctl-port`, signalfd, 1 Hz timerfd.
   Writer thread: bounded 16384-record ring -> per-session `can-YYYYMMDD-HHMMSS-NNN.lsc`;
   close ordered before open.
-- `linsight-cli`: stats/live/pause/resume/clear/export; `live` is newline-framed candump text.
+- `linsight-cli`: control commands use the Unix socket; `export`/`replay`/`compare` read
+  files directly and work without a running daemon. `live` is newline-framed candump text.
+  `config` sends only explicit fields and waits for the device ACK.
+- `.lsc` reader takes a record-count snapshot at open, so replaying the daemon's current
+  log terminates instead of following the growing file. Truncated tail records are EOF.
+- `replay` uses `AF_CAN`/`CAN_RAW` and `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`;
+  reports p99/max scheduling lateness. Replayed frames are captured again if the device
+  is on the same bus — replay in a quiet bus or account for the extra records.
+- `compare` matches FIFO per `(id, flags, dlc, data)` and reports missing/extra/order;
+  it is offline, so there are no cross-device latency statistics.
 - `protocol/frame.c` is pure C (no IDF, no malloc); keep it allocation-free and fuzzable.
 - Single device TCP client; the daemon is the only writer to `.lsc`.
 - On reconnect the device drains its PSRAM ring backlog first (up to ~52k records).
@@ -59,4 +80,5 @@ Chinese, one-line subject plus only necessary bullets; keep `build/`, logs and c
 ## Firmware
 
 Build/flash in the Windows checkout only: `idf.py build`, `idf.py -p COMx flash`.
-Never put Wi-Fi credentials or the host IP in this repo.
+Bench Wi-Fi credentials are committed in the firmware repo (`BENCH_*` in `main/net.c`);
+do not add secrets or host IPs to this repo.

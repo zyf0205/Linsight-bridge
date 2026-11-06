@@ -41,7 +41,7 @@ ring（约 52k 条）供网络排空，UI history 独立；主机追数据时 tr
 
 M0–M2 已跑通：采集/UI/流式/CONTROL-ACK/daemon/CLI/`.lsc`/导出。ESP32 自测
 30000 帧启动突发 4330 fps、96% 负载零丢失（未触发 ring 溢出）；外部 PCAN 经
-WSL2 SocketCAN 50 fps/10 s、1000 fps/3 s 零丢帧；主机 ctest 5/5。
+WSL2 SocketCAN 50 fps/10 s、1000 fps/10 s 零丢帧；主机 ctest 7/7、ASan/UBSan 通过。
 
 | 缺陷 | 影响 | 修复 |
 |---|---|---|
@@ -51,7 +51,8 @@ WSL2 SocketCAN 50 fps/10 s、1000 fps/3 s 零丢帧；主机 ctest 5/5。
 | `twai` restart/recover 无互斥 | 并发重启、paused 丢失、状态提前提交 | 重启锁；成功后才提交 bitrate/mode/state；保留 paused |
 | PCAN 假活无检测 | 高速灌帧后必须拔插 USB | 速率建议、单帧探测、stats 新鲜度、失败锁存 |
 
-M4 P0 待修：epoll 循环内阻塞 `send_all`、writer 丢帧计数未上报、`.lsc` 缺版本校验、
+M4 P0 已实现：`config` ACK、`replay`（40 帧 p99 0.30 ms）、`compare`、`.lsc` 魔数/
+版本校验、ASan/UBSan + CI。待修：epoll 循环内阻塞 `send_all`、writer 丢帧计数未上报、
 ASC 格式需 can-utils 对照。
 
 PCAN “假活”的复现与恢复见 [hardware.md](hardware.md) §5。
@@ -71,7 +72,7 @@ Windows 定时达不到 3500 fps 时降级为 1000 fps ×10 min 严格对照 + 6
 
 ## 5. M4 Linux 工具链
 
-P0（先做，单周可交付）：
+P0（已实现，见 `~/linsight/host`）：
 
 - `linsight-cli config`：只发显式字段，等待 ACK；非法值显示 `BAD_ARG`。
 - `replay`：AF_CAN/CAN_RAW + `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`，p99 误差 <5 ms。
@@ -79,7 +80,7 @@ P0（先做，单周可交付）：
 - `.lsc` 魔数 + 版本校验；ASan/UBSan + ctest 接入 CI。
 - 删除 `.lsc` 随机索引（顺序回放不需要）。
 
-P1：systemd/journald/logrotate、DBC（cantools）；物理 PCAN 的 SocketCAN 对照已打通
+P1（待做）：systemd/journald/logrotate、DBC（cantools）；物理 PCAN 的 SocketCAN 对照已打通
 （usbipd + `peak_usb` + `can0`，50/1000 fps 零丢帧；3500 fps 待亚毫秒节拍）。
 
 ## 6. M5 CLI 深化
@@ -103,7 +104,7 @@ P1：systemd/journald/logrotate、DBC（cantools）；物理 PCAN 的 SocketCAN 
 - 本仓库只提交固件；上位机在 `~/linsight` 单独提交；`protocol/`、`docs/` 改动两边同步。
 - 台架用 WSL `can0`（见 [hardware.md](hardware.md) §5）；Python 台架工具留在上位机仓。
 - 文档只放 `docs/`；协议以 `protocol/frame.h` 为准，不复制表格。
-- Wi-Fi 密码与主机 IP 只存在于忽略的 `sdkconfig`。
+- 台架 Wi-Fi/主机地址集中在 `main/net.c` 的 `BENCH_*` 宏（只重编一个文件，已提交）；生产部署改回 menuconfig/私密配置。Wi-Fi 使用 CN 1–13 信道。
 - 不提交 `build/`、`sdkconfig`、`managed_components/`；提交信息用中文。
 
 ## 9. 风险与简历

@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
@@ -317,6 +318,9 @@ typedef struct {
     uint8_t buf[128];
     int len;
     bool live;
+    bool filter_id_valid;
+    uint32_t filter_id;
+    int filter_ext; /* -1 = any, 0 = standard only, 1 = extended only */
     uint16_t pending_id; /* CONTROL id awaiting ACK, 0 = none */
 } cli_conn_t;
 
@@ -371,16 +375,23 @@ static void send_frame(int fd, uint8_t type, const void *payload, uint16_t len)
     }
 }
 
-static bool send_control(int fd, const char *action)
+static bool send_control_fields(int fd, const char *action, const char *fields)
 {
-    char json[64];
-    const int n = snprintf(json, sizeof(json), "{\"id\":%u,\"action\":\"%s\"}",
-                           (unsigned)++g_ctrl_id, action);
-    if (n <= 0) {
+    char json[LINSIGHT_MAX_CONTROL + 1];
+    const bool has_fields = fields && fields[0];
+    const int n = snprintf(json, sizeof(json), "{\"id\":%u,\"action\":\"%s\"%s%s}",
+                           (unsigned)++g_ctrl_id, action, has_fields ? "," : "",
+                           has_fields ? fields : "");
+    if (n <= 0 || n > (int)LINSIGHT_MAX_CONTROL) {
         return false;
     }
     send_frame(fd, LINSIGHT_FRAME_CONTROL, json, (uint16_t)n);
     return true;
+}
+
+static bool send_control(int fd, const char *action)
+{
+    return send_control_fields(fd, action, NULL);
 }
 
 /* ------------------------------------------------------------- frames */
@@ -394,7 +405,15 @@ static void deliver_live(const linsight_can_record_t *recs, uint32_t n)
         int len = 0;
         bool formatted = false;
         for (int c = 0; c < CLI_MAX; c++) {
-            if (g_cli[c].fd < 0 || !g_cli[c].live) {
+            cli_conn_t *cli = &g_cli[c];
+            if (cli->fd < 0 || !cli->live) {
+                continue;
+            }
+            if (cli->filter_id_valid && recs[i].id != cli->filter_id) {
+                continue;
+            }
+            const int rec_ext = (recs[i].flags & LINSIGHT_REC_FLAG_EXT) ? 1 : 0;
+            if (cli->filter_ext >= 0 && rec_ext != cli->filter_ext) {
                 continue;
             }
             if (!formatted) {
@@ -411,14 +430,14 @@ static void deliver_live(const linsight_can_record_t *recs, uint32_t n)
             /* Best-effort: a slow `live` consumer must never stall the device
              * RX / writer path. EAGAIN drops one line; a hard error or a
              * partial line (would corrupt the stream) closes the client. */
-            const ssize_t sent = send(g_cli[c].fd, line, (size_t)len, MSG_NOSIGNAL);
+            const ssize_t sent = send(cli->fd, line, (size_t)len, MSG_NOSIGNAL);
             if (sent == len) {
                 continue;
             }
             if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 continue;
             }
-            cli_close(&g_cli[c]);
+            cli_close(cli);
         }
     }
 }
@@ -622,8 +641,110 @@ static void cli_close(cli_conn_t *c)
     close(c->fd);
     c->fd = -1;
     c->live = false;
+    c->filter_id_valid = false;
+    c->filter_ext = -1;
     c->pending_id = 0;
     c->len = 0;
+}
+
+/* "id=0x123 ext" / "std" tokens for a live subscription. */
+static bool parse_live_filters(cli_conn_t *c, const char *args)
+{
+    c->filter_id_valid = false;
+    c->filter_ext = -1;
+    while (*args) {
+        while (*args == ' ') {
+            args++;
+        }
+        if (!*args) {
+            break;
+        }
+        if (strncmp(args, "id=", 3) == 0) {
+            char *end = NULL;
+            const unsigned long v = strtoul(args + 3, &end, 0);
+            if (end == args + 3 || v > 0x1FFFFFFFul) {
+                return false;
+            }
+            c->filter_id_valid = true;
+            c->filter_id = (uint32_t)v;
+            args = end;
+        } else if (strncmp(args, "ext", 3) == 0 &&
+                   (args[3] == '\0' || args[3] == ' ')) {
+            c->filter_ext = 1;
+            args += 3;
+        } else if (strncmp(args, "std", 3) == 0 &&
+                   (args[3] == '\0' || args[3] == ' ')) {
+            c->filter_ext = 0;
+            args += 3;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Build the optional JSON fragment for set_config from "bitrate=... mode=..."
+ * tokens. Only whitelisted values reach the device; anything else is rejected
+ * without forwarding a partial request. */
+static bool build_config_fields(const char *args, char *out, size_t cap)
+{
+    size_t used = 0;
+    bool any = false;
+    while (*args) {
+        while (*args == ' ') {
+            args++;
+        }
+        if (!*args) {
+            break;
+        }
+        if (strncmp(args, "bitrate=", 8) == 0) {
+            char *end = NULL;
+            const long v = strtol(args + 8, &end, 10);
+            if (end == args + 8 ||
+                (v != 125000 && v != 250000 && v != 500000 && v != 1000000)) {
+                return false;
+            }
+            const int n = snprintf(out + used, cap - used, "%s\"bitrate\":%ld",
+                                   any ? "," : "", v);
+            if (n < 0 || (size_t)n >= cap - used) {
+                return false;
+            }
+            used += (size_t)n;
+            any = true;
+            args = end;
+        } else if (strncmp(args, "mode=", 5) == 0) {
+            const char *start = args + 5;
+            const char *end = start;
+            while (*end && *end != ' ') {
+                end++;
+            }
+            const size_t len = (size_t)(end - start);
+            if (len == 0 || len >= 16) {
+                return false;
+            }
+            char mode[16];
+            memcpy(mode, start, len);
+            mode[len] = '\0';
+            if (strcasecmp(mode, "listen") != 0 &&
+                strcasecmp(mode, "listen_only") != 0 &&
+                strcasecmp(mode, "normal") != 0 &&
+                strcasecmp(mode, "selftest") != 0 &&
+                strcasecmp(mode, "no_ack") != 0) {
+                return false;
+            }
+            const int n = snprintf(out + used, cap - used, "%s\"mode\":\"%s\"",
+                                   any ? "," : "", mode);
+            if (n < 0 || (size_t)n >= cap - used) {
+                return false;
+            }
+            used += (size_t)n;
+            any = true;
+            args = end;
+        } else {
+            return false;
+        }
+    }
+    return any;
 }
 
 static void cli_dispatch(cli_conn_t *c)
@@ -655,8 +776,33 @@ static void cli_dispatch(cli_conn_t *c)
             (n <= 0) ? 0 : ((size_t)n >= sizeof(out) ? sizeof(out) - 1 : (size_t)n);
         send_all(c->fd, out, out_len);
         cli_close(c);
-    } else if (strcmp(cmd, "live") == 0) {
+    } else if (strcmp(cmd, "live") == 0 ||
+               (strncmp(cmd, "live ", 5) == 0)) {
+        if (!parse_live_filters(c, cmd + 4)) {
+            send_all(c->fd, "ERR bad live filter\n", strlen("ERR bad live filter\n"));
+            cli_close(c);
+            return;
+        }
         c->live = true; /* records stream until the client goes away */
+    } else if (strncmp(cmd, "config", 6) == 0 &&
+               (cmd[6] == '\0' || cmd[6] == ' ')) {
+        char fields[96];
+        if (!build_config_fields(cmd + 6, fields, sizeof(fields))) {
+            send_all(c->fd, "ERR bad config\n", strlen("ERR bad config\n"));
+            cli_close(c);
+            return;
+        }
+        if (g_dev.fd < 0) {
+            send_all(c->fd, "ERR no device\n", strlen("ERR no device\n"));
+            cli_close(c);
+            return;
+        }
+        if (!send_control_fields(g_dev.fd, LINSIGHT_CTRL_CONFIG, fields)) {
+            send_all(c->fd, "ERR send failed\n", strlen("ERR send failed\n"));
+            cli_close(c);
+            return;
+        }
+        c->pending_id = g_ctrl_id;
     } else if (strcmp(cmd, "pause") == 0 || strcmp(cmd, "resume") == 0 ||
                strcmp(cmd, "clear") == 0) {
         if (g_dev.fd < 0) {
@@ -695,6 +841,7 @@ static void cli_accept(int listen_fd)
     set_nonblock(fd);
     memset(slot, 0, sizeof(*slot));
     slot->fd = fd;
+    slot->filter_ext = -1;
     /* Use u64 tags everywhere; .ptr/u32 union mixes are ambiguous on 64-bit. */
     struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 0x100u + (uint64_t)(slot - g_cli)};
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, fd, &ev);
