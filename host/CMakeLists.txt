@@ -62,4 +62,20 @@ if(Python3_FOUND)
     add_test(NAME integration
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration.py
                      $<TARGET_FILE:linsightd> $<TARGET_FILE:linsight-cli>)
+    add_test(NAME rotation
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/rotation.py
+                     $<TARGET_FILE:linsightd>)
 endif()
+
+# Install: binaries, single-file dashboard, systemd unit + /etc/default args.
+include(GNUInstallDirs)
+install(TARGETS linsightd linsight-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES web/index.html DESTINATION ${CMAKE_INSTALL_DATADIR}/linsight/web)
+configure_file(systemd/linsightd.service.in
+               ${CMAKE_CURRENT_BINARY_DIR}/linsightd.service @ONLY)
+configure_file(systemd/linsightd.default.in
+               ${CMAKE_CURRENT_BINARY_DIR}/linsightd.default @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/linsightd.service
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/linsightd.default
+        DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/default RENAME linsightd)

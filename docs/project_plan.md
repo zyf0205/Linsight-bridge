@@ -38,9 +38,10 @@ ring（约 52k 条）供网络排空，UI history 独立；主机追数据时 tr
 
 ## 3. 现状与缺陷
 
-M0–M2 已跑通：采集/UI/流式/CONTROL-ACK/daemon/CLI/`.lsc`/导出。ESP32 自测 30000 帧
-启动突发 4330 fps、96% 负载零丢失（未触发 ring 溢出）；外部 PCAN 经 WSL2 50/1000 fps
-各 10 s 零丢帧；主机 ctest 7/7、ASan/UBSan 通过，集成测试覆盖 CLI、`.lsc`、HTTP/SSE 与 Web 控制。
+M0–M2 已跑通：采集/UI/流式/CONTROL-ACK/daemon/CLI/`.lsc`/导出；ctest 8/8、ASan/UBSan 通过，
+集成测试覆盖 CLI、`.lsc`、HTTP/SSE、Web 控制与 1 MB 分卷轮转。ESP32 自测 30000 帧启动
+突发 4330 fps、96% 负载零丢失。M3.1：60 万帧/10.9 min（917 fps）计数器 0..599999 连续、
+零丢帧；M3.4：1 Mbps/60 s 54k 帧零丢、无复位/WDT（825 fps，~10% 负载）；M3.5：堆 +1.9 KB。
 
 | 缺陷 | 影响 | 修复 |
 |---|---|---|
@@ -66,7 +67,8 @@ PCAN “假活”的复现与恢复见 [hardware.md](hardware.md) §5。
 | M3.4 1 Mbps ×60 s | SELFTEST 自发或 PCAN 发送 | 允许 ring drop 但必须可见；无复位/WDT |
 | M3.5 10 min 资源 | 1 Hz 日志补 `esp_get_free_heap_size()` / PSRAM free | 内部堆增量 <8 KB，PSRAM 增量 <64 KB |
 
-Windows 定时达不到 3500 fps 时降级为 1000 fps ×10 min 严格对照 + 60 s 高负载，并写明实际速率。
+Windows 定时或 PCAN-USB（经 usbip 约 1 ms/帧）达不到 3500 fps 时降级为 1000 fps ×10 min
+严格对照 + 60 s 高负载，并写明实际速率（本轮实测 917/825 fps）。
 
 ## 5. M4 Linux 工具链
 
@@ -77,8 +79,8 @@ P0（已实现，见 `~/linsight/host`）：
 - `compare`：按 `(id, flags, dlc, data)` FIFO 匹配，报告 missing/duplicate/order；不做跨设备延迟分位。
 - `.lsc` 魔数 + 版本校验；ASan/UBSan + ctest 接入 CI；删除随机索引（顺序回放不需要）。
 
-P1（待做）：systemd/journald/logrotate、DBC（cantools）；物理 PCAN 的 SocketCAN 对照已打通
-（usbipd + `peak_usb` + `can0`，50/1000 fps 零丢帧；3500 fps 待亚毫秒节拍）。
+P1：systemd（`DynamicUser` + journald）与 daemon 侧 `--log-max-mb` 分卷已实现；DBC 待做。
+物理 PCAN 的 SocketCAN 对照已打通（usbipd + `peak_usb` + `can0`，50–917 fps 零丢帧；更高节拍受适配器 ~1 ms/帧限制）。
 
 ## 6. M5 CLI 深化与 Web 可视化
 
@@ -92,9 +94,8 @@ SSE 每事件 ≤64 条、发送非阻塞（慢浏览器丢事件）；`/api/con
 
 ## 7. M6 Soak 与交付
 
-24 h soak（设备 + daemon + CLI）：1000 fps 约 1.7 GB、3500 fps 约 6.9 GB，必须配置
-日志轮转。指标：RSS/句柄稳定、无复位、writer 与设备丢帧计数符合预期。
-交付：README、接线图、3 min 演示、tag + changelog；简历数字按实测回填。
+24 h soak：1000 fps 约 1.7 GB；`--log-max-mb` 分卷与 `tools/can_soak.py` 已就绪，24 h 长跑待执行。
+交付：`host/README.md`、接线图、CHANGELOG、tag v0.2.0；简历数字按实测回填。
 
 ## 8. 工程约定
 
@@ -115,5 +116,5 @@ SSE 每事件 ≤64 条、发送非阻塞（慢浏览器丢事件）；`/api/con
 > **LinSight CAN — 无线 CAN 总线分析仪（ESP32-S3 + Linux）**
 > - TWAI 采集 + PSRAM ring + 时间戳；LVGL 触摸屏 20 fps 实时 trace/负载/错误。
 > - Linux C 守护进程：epoll + 非阻塞 TCP + 写线程 + 二进制日志/ASC 导出 + CLI。
-> - 500 kbps/80% 10 min 零丢帧、bus-off 自愈、24 h soak 无泄漏（数字待实测回填）。
+> - 10.9 min 连续 60 万帧零丢帧（计数器逐帧校验）、1 Mbps 稳定、bus-off 自愈；24 h 待跑。
 > - 共享协议解析器 fuzz + ctest/ASan CI；SocketCAN 回放与双路对照（M4）。

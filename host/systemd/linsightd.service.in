@@ -1,0 +1,25 @@
+[Unit]
+Description=LinSight CAN capture daemon
+Documentation=file://@CMAKE_INSTALL_FULL_DATADIR@/linsight/web/index.html
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=linsight
+RuntimeDirectory=linsight
+EnvironmentFile=-/etc/default/linsightd
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/linsightd $LINSIGHTD_ARGS
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/linsight /run/linsight
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

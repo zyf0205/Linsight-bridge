@@ -53,6 +53,8 @@ static const char *g_port = "8888";
 static const char *g_ctl_path = "/tmp/linsight.sock";
 static const char *g_ctl_port = NULL; /* optional loopback TCP control port */
 static const char *g_log_dir = ".";
+static uint64_t g_log_max_bytes; /* 0 = one file per session */
+static char g_current_log[512];
 static int g_http_port = 8080;    /* 0 disables the dashboard */
 static const char *g_http_bind = "127.0.0.1";
 static const char *g_web_dir = "web";
@@ -197,12 +199,39 @@ static void wring_set_bitrate(uint32_t bitrate)
     pthread_mutex_unlock(&g_ring.lock);
 }
 
+/* Current .lsc file, published by the writer thread for stats/CLI. */
+static void wring_set_current_log(const char *path)
+{
+    pthread_mutex_lock(&g_ring.lock);
+    snprintf(g_current_log, sizeof(g_current_log), "%s", path);
+    pthread_mutex_unlock(&g_ring.lock);
+}
+
+/* `base` is the per-session path; rotated parts keep the session name and add
+ * -pNNN before the extension. */
+static void log_part_path(const char *base, uint32_t part, char *out, size_t cap)
+{
+    if (part == 0) {
+        snprintf(out, cap, "%s", base);
+        return;
+    }
+    const char *dot = strrchr(base, '.');
+    if (dot) {
+        snprintf(out, cap, "%.*s-p%03u%s", (int)(dot - base), base, (unsigned)part, dot);
+    } else {
+        snprintf(out, cap, "%s-p%03u", base, (unsigned)part);
+    }
+}
+
 static void *writer_thread(void *arg)
 {
     (void)arg;
     lsc_writer_t w = {0};
     bool log_open = false;
     uint32_t log_gen = 0;
+    char base_path[512] = {0};
+    uint64_t log_start_wall = 0;
+    uint32_t log_part = 0;
 
     for (;;) {
         pthread_mutex_lock(&g_ring.lock);
@@ -250,7 +279,12 @@ static void *writer_thread(void *arg)
                     log_open = lsc_writer_open(&w, path, wring_bitrate(), start_wall) == 0;
                     log_gen = e->gen;
                     wring_clear_close_before(log_gen);
-                    if (!log_open) {
+                    if (log_open) {
+                        snprintf(base_path, sizeof(base_path), "%s", path);
+                        log_start_wall = start_wall;
+                        log_part = 0;
+                        wring_set_current_log(base_path);
+                    } else {
                         fprintf(stderr, TAG ": cannot open %s: %s\n", path, strerror(errno));
                     }
                 }
@@ -258,6 +292,27 @@ static void *writer_thread(void *arg)
                     /* The open request was superseded (quick reconnect) or the
                      * file could not be created: drop this stale generation. */
                     continue;
+                }
+            }
+
+            /* Size cap: start a new part before this record would cross it.
+             * The session anchor stays the same, so timestamps remain a single
+             * continuous uptime axis across the parts. */
+            if (log_open && g_log_max_bytes > 0 &&
+                (uint64_t)LSC_HEADER_SIZE + (w.written + 1) * LINSIGHT_REC_SIZE >
+                    g_log_max_bytes) {
+                char next[560];
+                lsc_writer_close(&w);
+                log_open = false;
+                log_part++;
+                log_part_path(base_path, log_part, next, sizeof(next));
+                log_open = lsc_writer_open(&w, next, wring_bitrate(), log_start_wall) == 0;
+                if (log_open) {
+                    wring_set_current_log(next);
+                    fprintf(stderr, TAG ": log rotated to %s\n", next);
+                } else {
+                    fprintf(stderr, TAG ": cannot rotate log to %s: %s\n", next,
+                            strerror(errno));
                 }
             }
 
@@ -349,7 +404,6 @@ static cli_conn_t g_cli[CLI_MAX];
 static int g_epoll = -1;
 static volatile sig_atomic_t g_stop;
 static uint16_t g_ctrl_id;
-static char g_current_log[512];
 static uint64_t g_session_start;
 
 static void set_nonblock(int fd)
@@ -608,9 +662,9 @@ static void device_close(void)
     pthread_mutex_lock(&g_ring.lock);
     g_ring.close_req = true;
     g_ring.close_gen = g_ring.gen;
+    g_current_log[0] = '\0';
     pthread_cond_signal(&g_ring.cond);
     pthread_mutex_unlock(&g_ring.lock);
-    g_current_log[0] = '\0';
 }
 
 static void device_accept(int listen_fd)
@@ -639,6 +693,7 @@ static void device_accept(int listen_fd)
     struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 0}; /* u64 0 = device */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, fd, &ev);
 
+    char announced[512];
     pthread_mutex_lock(&g_ring.lock);
     time_t t = time(NULL);
     struct tm tm;
@@ -653,11 +708,12 @@ static void device_accept(int listen_fd)
              "%s/can-%04d%02d%02d-%02d%02d%02d-%03u.lsc", g_log_dir, tm.tm_year + 1900,
              tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, session_seq);
     snprintf(g_current_log, sizeof(g_current_log), "%s", g_ring.open_path);
+    snprintf(announced, sizeof(announced), "%s", g_current_log);
     g_ring.open_req = true;
     pthread_cond_signal(&g_ring.cond);
     pthread_mutex_unlock(&g_ring.lock);
 
-    fprintf(stderr, TAG ": device connected, logging to %s\n", g_current_log);
+    fprintf(stderr, TAG ": device connected, logging to %s\n", announced);
 }
 
 static void cli_close(cli_conn_t *c)
@@ -774,9 +830,11 @@ static bool build_config_fields(const char *args, char *out, size_t cap)
 
 static size_t build_stats_json(char *out, size_t cap)
 {
+    char log_path[512];
     pthread_mutex_lock(&g_ring.lock);
     const uint64_t written = g_ring.written;
     const uint64_t dropped = g_ring.dropped;
+    snprintf(log_path, sizeof(log_path), "%s", g_current_log);
     pthread_mutex_unlock(&g_ring.lock);
 
     const int n = snprintf(
@@ -785,7 +843,7 @@ static size_t build_stats_json(char *out, size_t cap)
         "\"log\":\"%s\",\"stats\":%s}",
         g_dev.fd >= 0 ? "true" : "false", (unsigned long long)g_dev.recs,
         (unsigned long long)written, (unsigned long long)dropped,
-        g_current_log[0] ? g_current_log : "", g_dev.stats[0] ? g_dev.stats : "{}");
+        log_path[0] ? log_path : "", g_dev.stats[0] ? g_dev.stats : "{}");
     if (n <= 0) {
         return 0;
     }
@@ -1004,6 +1062,14 @@ int main(int argc, char **argv)
             g_ctl_port = argv[i];
         } else if (strcmp(argv[i], "--log-dir") == 0 && i + 1 < argc) {
             g_log_dir = argv[++i];
+        } else if (strcmp(argv[i], "--log-max-mb") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            const unsigned long long mb = strtoull(argv[++i], &end, 10);
+            if (end == argv[i] || *end || mb > 1024ull * 1024ull) {
+                fprintf(stderr, "linsightd: bad log size '%s'\n", argv[i]);
+                return 1;
+            }
+            g_log_max_bytes = mb * 1024ull * 1024ull; /* 0 keeps one file/session */
         } else if (strcmp(argv[i], "--http-port") == 0 && i + 1 < argc) {
             const int p = atoi(argv[++i]);
             if (p < 0 || p > 65535) {
@@ -1019,8 +1085,8 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "usage: linsightd [--port N] [--ctl PATH] [--ctl-port N] "
                     "[--log-dir DIR]\n"
-                    "                  [--http-port N] [--http-bind ADDR] "
-                    "[--web-dir DIR]\n");
+                    "                  [--log-max-mb N] [--http-port N] "
+                    "[--http-bind ADDR] [--web-dir DIR]\n");
             return 1;
         }
     }

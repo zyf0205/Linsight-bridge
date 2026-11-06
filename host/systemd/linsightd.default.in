@@ -1,0 +1,3 @@
+# Arguments for linsightd.service (read by EnvironmentFile=-/etc/default/linsightd).
+# Keep the dashboard on loopback; use --http-bind 0.0.0.0 only on an isolated bench.
+LINSIGHTD_ARGS=--port 8888 --ctl /run/linsight/ctl.sock --ctl-port 8889 --log-dir /var/lib/linsight --log-max-mb 128 --http-port 8080 --http-bind 127.0.0.1 --web-dir @CMAKE_INSTALL_FULL_DATADIR@/linsight/web

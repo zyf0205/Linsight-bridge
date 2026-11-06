@@ -12,10 +12,12 @@ Layout:
 - `host/src/` — daemon, `.lsc` writer/reader, replay, compare, device session, HTTP/SSE
 - `host/cli/` — stats/live/config/pause/resume/clear/export/replay/compare
 - `host/web/index.html` — single-file dashboard (served by `linsightd`, no build step)
-- `host/tests/` — record/parser/fuzz/ring/canlog/compare/integration (includes HTTP/SSE)
+- `host/systemd/` — service unit + `/etc/default` args (CMake `install` targets)
+- `host/tests/` — record/parser/fuzz/ring/canlog/compare/integration/rotation
 - `protocol/` — shared v2.0 parser (mirror of the firmware repo)
 - `firmware/can_ring.c/h` — read-only copy of the firmware ring for `test_ring`
 - `tools/bench_can.py` — optional python-can bench tool; `cangen` is the primary bench
+- `tools/can_soak.py` — AF_CAN 32-bit-counter generator + `.lsc` verifier
 - `docs/` — project docs mirrored from the firmware repo
 
 ## Commands
@@ -27,7 +29,7 @@ ctest --test-dir build --output-on-failure
 cmake -S . -B build-asan -DLINSIGHT_SANITIZE=ON   # ASan/UBSan build
 
 build/linsightd --port 8888 --ctl-port 8889 --log-dir ~/can-logs \
-                --http-port 8080 --http-bind 127.0.0.1 --web-dir web
+                --log-max-mb 128 --http-port 8080 --http-bind 127.0.0.1 --web-dir web
 build/linsight-cli stats [--watch] [--interval MS]
 build/linsight-cli live [--id 0x123] [--ext|--std] [--color]
 build/linsight-cli config --bitrate 500000 --mode normal
@@ -36,6 +38,10 @@ build/linsight-cli export candump FILE.lsc [-o OUT] [--id ID] [--ext|--std]
                                      [--from EPOCH] [--to EPOCH]
 build/linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]
 build/linsight-cli compare REF.lsc CAND.lsc
+
+sudo cmake --install build        # binaries + web + systemd unit + /etc/default
+python3 ../tools/can_soak.py --iface can0 --rate 1000 --duration 600 --record /tmp/tx.csv
+python3 ../tools/can_soak.py --verify FILE.lsc --expect 600000
 ```
 
 Dashboard: `http://127.0.0.1:8080/` (Windows browser via WSL localhost forwarding);
@@ -62,6 +68,8 @@ cangen can0 -n 500 -g 20 -I 0x123 -L 8   # 50 fps x 10 s; device total is ground
   `/tmp/linsight.sock` for the CLI, optional loopback `--ctl-port`, optional HTTP
   dashboard, signalfd, 1 Hz timerfd. Writer thread: bounded 16384-record ring ->
   per-session `can-YYYYMMDD-HHMMSS-NNN.lsc`; close ordered before open.
+  `--log-max-mb N` rotates a session into `-pNNN` parts before a record crosses the
+  cap; all parts share the session anchor, so timestamps stay continuous.
 - HTTP dashboard (`src/http.c`): same epoll loop, `HTTP_MAX_CLIENTS` fixed slots.
   `/api/live` is Server-Sent Events; each event is a JSON array of ≤64 records.
   Sends are nonblocking — a slow browser drops events instead of stalling CAN RX.
