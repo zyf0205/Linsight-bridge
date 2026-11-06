@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LinSight · CAN</title>
+<style>
+:root{
+  --bg:#08080a; --panel:#141416; --panel2:#1c1c1e; --line:#26262a;
+  --text:#f4f4f6; --dim:#8e8e93; --blue:#0a84ff; --purple:#bf5af2;
+  --green:#30d158; --orange:#ff9f0a; --red:#ff453a;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--text);
+  font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+header{
+  position:sticky;top:0;z-index:5;display:flex;align-items:center;
+  justify-content:space-between;gap:16px;flex-wrap:wrap;
+  padding:12px 18px;border-bottom:1px solid var(--line);
+  background:rgba(8,8,10,.94);backdrop-filter:blur(10px);
+}
+.brand{display:flex;align-items:center;gap:11px}
+.mark{display:flex;align-items:flex-end;gap:3px;height:26px}
+.mark i{display:block;width:5px;border-radius:2px;background:var(--blue)}
+.mark i:nth-child(1){height:10px;opacity:.55}
+.mark i:nth-child(2){height:17px;opacity:.8}
+.mark i:nth-child(3){height:26px}
+h1{font-size:17px;font-weight:650;letter-spacing:.2px;margin:0}
+.brand p{margin:0;color:var(--dim);font-size:11px;letter-spacing:.4px;text-transform:uppercase}
+.headstatus{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.pill{
+  display:inline-flex;align-items:center;justify-content:center;min-width:76px;
+  padding:4px 10px;border-radius:999px;font-size:11px;font-weight:700;
+  letter-spacing:.5px;background:var(--panel2);color:var(--dim);
+}
+.pill.ok{background:var(--green);color:#062b11}
+.pill.warn{background:var(--orange);color:#2b1600}
+.pill.bad{background:var(--red);color:#2b0503}
+.kv{font-family:var(--mono);font-size:12px;color:var(--text)}
+.link{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dim);
+  letter-spacing:.4px;text-transform:uppercase}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--dim)}
+.dot.ok{background:var(--green)}.dot.warn{background:var(--orange)}
+.dot.bad{background:var(--red)}
+main{padding:14px 16px 8px;max-width:1440px;margin:0 auto}
+.tiles{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:12px}
+.tile{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:10px 12px;min-width:0}
+.tile label{display:block;font-size:10px;letter-spacing:.7px;color:var(--dim);
+  text-transform:uppercase;margin-bottom:3px}
+.tile b{display:block;font-family:var(--mono);font-size:20px;font-weight:550;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile small{display:block;color:var(--dim);font-size:10px;margin-top:1px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  min-width:0;overflow:hidden}
+.controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:9px 11px;margin-bottom:12px}
+.ctlgroup{display:flex;align-items:center;gap:6px}
+.ctlgroup>label{font-size:10px;letter-spacing:.6px;color:var(--dim);text-transform:uppercase}
+select,input,.btn{
+  font:inherit;color:var(--text);background:var(--panel2);
+  border:1px solid var(--line);border-radius:7px;padding:6px 9px;outline:0;
+}
+select,input{font-family:var(--mono);font-size:12px}
+input{width:150px}
+.btn{cursor:pointer;font-size:12px;transition:background .12s,border-color .12s}
+.btn:hover{background:#242428;border-color:#38383e}
+.btn:active{background:#2e2e33}
+.btn.active{background:rgba(10,132,255,.2);border-color:var(--blue);color:#9fcaff}
+.btn.danger:hover{border-color:var(--red);color:#ffb4ae}
+.spacer{flex:1}
+.layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:12px;align-items:start}
+aside{display:grid;gap:12px}
+.cardhead{display:flex;align-items:center;justify-content:space-between;
+  gap:10px;padding:9px 12px;border-bottom:1px solid var(--line)}
+.cardhead h2{font-size:11px;letter-spacing:.7px;text-transform:uppercase;
+  color:var(--dim);font-weight:600;margin:0}
+.cardhead b{font-family:var(--mono);font-size:13px;font-weight:500}
+.trace{display:flex;flex-direction:column}
+.tablewrap{max-height:calc(100vh - 330px);min-height:330px;overflow:auto}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+th,td{text-align:left;padding:0 10px;height:22px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+th{position:sticky;top:0;z-index:1;background:var(--panel);color:var(--dim);
+  font-size:10px;letter-spacing:.6px;font-weight:600;text-transform:uppercase;
+  border-bottom:1px solid var(--line)}
+tbody tr:nth-child(even){background:rgba(255,255,255,.018)}
+tbody tr:hover{background:rgba(255,255,255,.045)}
+td{font-size:12px}
+th:nth-child(1),td:nth-child(1){width:74px}
+th:nth-child(2),td:nth-child(2){width:96px}
+th:nth-child(3),td:nth-child(3){width:52px}
+th:nth-child(4),td:nth-child(4){width:40px}
+th:nth-child(6),td:nth-child(6){width:60px;text-align:right}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.dim{color:var(--dim)}.r{text-align:right}
+.blue{color:var(--blue)}.purple{color:var(--purple)}.red{color:var(--red)}
+.data{color:#d7d7dc;letter-spacing:.3px}
+.tag{display:inline-block;padding:1px 5px;border-radius:4px;font-size:9px;
+  font-weight:700;letter-spacing:.4px;background:var(--panel2);color:var(--dim)}
+.tag.std{color:var(--blue)}.tag.ext{color:var(--purple)}
+.tag.rtr{color:var(--orange)}.tag.err{color:var(--red)}
+.empty{color:var(--dim);text-align:center;padding:26px 10px;font-size:13px}
+.chart canvas{display:block;width:100%;height:62px}
+.ids{padding-bottom:6px}
+.idlist{padding:7px 10px 2px}
+.idrow{display:grid;grid-template-columns:66px 1fr 48px;align-items:center;
+  gap:8px;height:24px;font-family:var(--mono);font-size:11px}
+.idrow .bar{height:6px;border-radius:3px;background:var(--panel2);overflow:hidden}
+.idrow .bar i{display:block;height:100%;background:var(--blue);border-radius:3px}
+.idrow .n{text-align:right;color:var(--dim)}
+.idrow.ext .bar i{background:var(--purple)}
+.toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,18px);
+  background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+  padding:9px 15px;font-size:12px;opacity:0;pointer-events:none;
+  transition:opacity .16s,transform .16s;z-index:20;max-width:90vw}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.toast.bad{border-color:var(--red);color:#ffb4ae}
+footer{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  padding:4px 18px 14px;color:var(--dim);font-size:10px;max-width:1440px;
+  margin:0 auto;font-family:var(--mono)}
+@media (max-width:1000px){
+  .tiles{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .layout{grid-template-columns:1fr}
+  aside{grid-template-columns:1fr 1fr;order:-1}
+  aside .ids{grid-column:1/-1}
+  .tablewrap{max-height:52vh}
+}
+@media (max-width:560px){
+  main{padding:10px}
+  .tiles{grid-template-columns:repeat(2,minmax(0,1fr))}
+  aside{grid-template-columns:1fr}
+  input{width:110px}
+  .headstatus{gap:7px}
+  th:nth-child(1),td:nth-child(1){width:62px}
+  th:nth-child(2),td:nth-child(2){width:78px}
+  .brand p{display:none}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="mark"><i></i><i></i><i></i></span>
+    <div><h1>LinSight</h1><p>wireless CAN analyzer</p></div>
+  </div>
+  <div class="headstatus">
+    <span class="pill" id="busPill">STOPPED</span>
+    <span class="kv" id="br">—</span>
+    <span class="kv" id="mode">—</span>
+    <span class="link"><span class="dot" id="linkDot"></span><span id="linkText">CONNECTING</span></span>
+  </div>
+</header>
+
+<main>
+  <section class="tiles">
+    <div class="tile"><label>Frames / s</label><b id="fps">—</b><small id="uptime">uptime —</small></div>
+    <div class="tile"><label>Bus load</label><b id="load">—</b><small>estimated</small></div>
+    <div class="tile"><label>TEC / REC</label><b id="err">—</b><small>error counters</small></div>
+    <div class="tile"><label>Overflow</label><b id="ovf">—</b><small>capture + log drops</small></div>
+    <div class="tile"><label>Frames</label><b id="total">—</b><small id="recsub">logged —</small></div>
+    <div class="tile"><label>Ring</label><b id="ring">—</b><small id="ringsub">capacity —</small></div>
+  </section>
+
+  <section class="controls card">
+    <div class="ctlgroup">
+      <label for="bitrate">Bitrate</label>
+      <select id="bitrate">
+        <option value="125000">125K</option>
+        <option value="250000">250K</option>
+        <option value="500000" selected>500K</option>
+        <option value="1000000">1M</option>
+      </select>
+      <button class="btn" id="applyBr">Set</button>
+    </div>
+    <button class="btn" id="modeBtn">Mode</button>
+    <button class="btn" id="pauseBtn">Pause</button>
+    <button class="btn danger" id="clearBtn">Clear</button>
+    <div class="spacer"></div>
+    <input id="filter" placeholder="filter ID (hex)" spellcheck="false" autocomplete="off">
+    <button class="btn" id="freezeBtn">Freeze</button>
+  </section>
+
+  <section class="layout">
+    <div class="card trace">
+      <div class="cardhead"><h2>Live frames</h2><span class="dim" id="streamState">connecting…</span></div>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Time</th><th>ID</th><th>Type</th><th>DLC</th><th>Data</th><th class="r">Count</th></tr></thead>
+          <tbody id="rows"><tr class="empty"><td colspan="6">Waiting for CAN frames…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <aside>
+      <div class="card chart">
+        <div class="cardhead"><h2>Frames / second</h2><b id="fpsNow">0</b></div>
+        <canvas id="fpsChart"></canvas>
+      </div>
+      <div class="card chart">
+        <div class="cardhead"><h2>Bus load</h2><b id="loadNow">0%</b></div>
+        <canvas id="loadChart"></canvas>
+      </div>
+      <div class="card ids">
+        <div class="cardhead"><h2>Top IDs</h2></div>
+        <div class="idlist" id="idlist"><div class="empty">—</div></div>
+      </div>
+    </aside>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+<footer><span>linsightd · HTTP + SSE · single epoll loop</span><span id="logPath"></span></footer>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const MAX_ROWS = 26;
+  const MAX_SAMPLES = 60;
+
+  const state = {
+    rows: [],
+    counts: new Map(),
+    filter: "",
+    frozen: false,
+    sse: false,
+    device: false,
+    stats: {},
+  };
+  let renderPending = false;
+  let toastTimer = 0;
+
+  const isExt = (f) => (f.f & 1) !== 0;
+  const isRtr = (f) => (f.f & 2) !== 0;
+  const isErr = (f) => (f.f & 4) !== 0;
+  const keyOf = (f) => `${f.i}:${f.f & 1}`;
+  const hexId = (f) => f.i.toString(16).toUpperCase().padStart(isExt(f) ? 8 : 3, "0");
+
+  function fmt(n) {
+    n = Number(n) || 0;
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+    return String(n);
+  }
+  function brName(b) {
+    b = Number(b) || 0;
+    return b === 1000000 ? "1M" : b ? b / 1000 + "K" : "—";
+  }
+  function toast(msg, ok = true) {
+    const t = $("toast");
+    t.textContent = msg;
+    t.className = "toast show" + (ok ? "" : " bad");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { t.className = "toast"; }, 1800);
+  }
+
+  function ingest(batch) {
+    if (!Array.isArray(batch) || !batch.length) return;
+    for (const f of batch) {
+      state.rows.push(f);
+      const k = keyOf(f);
+      const c = state.counts.get(k) || { id: f.i, ext: isExt(f), n: 0 };
+      c.n++;
+      state.counts.set(k, c);
+    }
+    if (state.rows.length > 900) state.rows.splice(0, state.rows.length - 900);
+    if (state.counts.size > 512) state.counts.clear();
+    schedule();
+  }
+
+  function schedule() {
+    if (state.frozen || renderPending) return;
+    renderPending = true;
+    requestAnimationFrame(() => { renderPending = false; render(); });
+  }
+
+  function render() {
+    renderRows();
+    renderIds();
+  }
+
+  function renderRows() {
+    const q = state.filter.trim().toUpperCase();
+    let rows = state.rows;
+    if (q) rows = rows.filter((f) => hexId(f).includes(q));
+    rows = rows.slice(-MAX_ROWS).reverse();
+
+    const body = $("rows");
+    if (!rows.length) {
+      body.innerHTML = `<tr class="empty"><td colspan="6">${
+        state.frozen ? "Display frozen" : "Waiting for CAN frames…"
+      }</td></tr>`;
+      return;
+    }
+    body.innerHTML = rows.map((f) => {
+      const ext = isExt(f), rtr = isRtr(f), err = isErr(f);
+      const id = err ? "ERR-FRM" : hexId(f);
+      const type = err ? "ERR" : rtr ? "RTR" : ext ? "EXT" : "STD";
+      const data = f.d ? (f.b.match(/../g) || []).join(" ") : "";
+      const c = state.counts.get(keyOf(f));
+      return `<tr>
+        <td class="mono dim">${(f.t / 1000).toFixed(3)}</td>
+        <td class="mono ${err ? "red" : ext ? "purple" : "blue"}">${id}</td>
+        <td><span class="tag ${type.toLowerCase()}">${type}</span></td>
+        <td class="mono">${f.d}</td>
+        <td class="mono data">${data}</td>
+        <td class="mono r dim">${c ? fmt(c.n) : ""}</td>
+      </tr>`;
+    }).join("");
+  }
+
+  function renderIds() {
+    const top = [...state.counts.values()].sort((a, b) => b.n - a.n).slice(0, 8);
+    const box = $("idlist");
+    if (!top.length) { box.innerHTML = '<div class="empty">—</div>'; return; }
+    const max = top[0].n || 1;
+    box.innerHTML = top.map((c) => {
+      const id = c.id.toString(16).toUpperCase().padStart(c.ext ? 8 : 3, "0");
+      return `<div class="idrow ${c.ext ? "ext" : ""}">
+        <span class="${c.ext ? "purple" : "blue"}">${id}</span>
+        <span class="bar"><i style="width:${Math.max(3, (c.n / max) * 100)}%"></i></span>
+        <span class="n">${fmt(c.n)}</span>
+      </div>`;
+    }).join("");
+  }
+
+  const samples = [];
+  function drawSpark(canvas, values, color, max) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth || 280;
+    const h = canvas.clientHeight || 62;
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = "rgba(142,142,147,.16)";
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {
+      const y = Math.round((h * i) / 4) + 0.5;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    }
+    if (values.length < 2) return;
+    const n = values.length;
+    const scale = Math.max(1, max);
+    ctx.beginPath();
+    values.forEach((v, i) => {
+      const x = (i * w) / (n - 1);
+      const y = h - 2 - Math.min(1, v / scale) * (h - 6);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.6;
+    ctx.lineJoin = "round";
+    ctx.stroke();
+    ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
+    ctx.fillStyle = color + "22";
+    ctx.fill();
+  }
+
+  function pushSample(s) {
+    samples.push({ fps: Number(s.fps) || 0, load: (Number(s.load_permille) || 0) / 10 });
+    if (samples.length > MAX_SAMPLES) samples.shift();
+    $("fpsNow").textContent = fmt(s.fps || 0);
+    $("loadNow").textContent = (((Number(s.load_permille) || 0) / 10)).toFixed(0) + "%";
+    drawSpark($("fpsChart"), samples.map((x) => x.fps), "#0a84ff",
+              Math.max(1000, ...samples.map((x) => x.fps)));
+    drawSpark($("loadChart"), samples.map((x) => x.load), "#ff9f0a", 100);
+  }
+
+  function setLink() {
+    const dot = $("linkDot");
+    const text = $("linkText");
+    if (!state.sse) {
+      dot.className = "dot bad"; text.textContent = "STREAM LOST";
+    } else if (!state.device) {
+      dot.className = "dot warn"; text.textContent = "NO DEVICE";
+    } else {
+      dot.className = "dot ok"; text.textContent = "DEVICE";
+    }
+    $("streamState").textContent = state.sse ? "SSE live" : "reconnecting…";
+  }
+
+  function apply(j) {
+    const s = j.stats || {};
+    state.stats = s;
+    const br = Number(s.bitrate) || 0;
+    const mode = s.mode || "—";
+    $("fps").textContent = fmt(s.fps || 0);
+    $("load").textContent = (((Number(s.load_permille) || 0) / 10)).toFixed(0) + "%";
+    $("err").textContent = `${s.tec || 0} / ${s.rec || 0}`;
+    $("ovf").textContent = fmt((Number(s.dropped) || 0) + (Number(j.dropped) || 0));
+    $("total").textContent = fmt(j.records || 0);
+    $("recsub").textContent = "logged " + fmt(j.written || 0);
+    $("ring").textContent = fmt(s.ring_used || 0);
+    $("ringsub").textContent = "capacity " + fmt(s.ring_cap || 0);
+    $("br").textContent = brName(br);
+    $("mode").textContent = mode + (s.paused ? " · PAUSED" : "");
+    $("pauseBtn").textContent = s.paused ? "Resume" : "Pause";
+
+    const pill = $("busPill");
+    const st = String(s.state || "");
+    if (st === "BUS_OFF") { pill.textContent = "BUS-OFF"; pill.className = "pill bad"; }
+    else if (st === "RUNNING" && (s.tec >= 128 || s.rec >= 128)) {
+      pill.textContent = "PASSIVE"; pill.className = "pill warn";
+    } else if (st === "RUNNING") { pill.textContent = "ACTIVE"; pill.className = "pill ok"; }
+    else if (st === "RECOVERING") { pill.textContent = "RECOVERING"; pill.className = "pill warn"; }
+    else { pill.textContent = st || "STOPPED"; pill.className = "pill"; }
+
+    const up = Math.floor((Number(s.uptime_ms) || 0) / 1000);
+    const hh = String(Math.floor(up / 3600)).padStart(2, "0");
+    const mm = String(Math.floor((up % 3600) / 60)).padStart(2, "0");
+    const ss = String(up % 60).padStart(2, "0");
+    $("uptime").textContent = `uptime ${hh}:${mm}:${ss}`;
+    $("logPath").textContent = j.log || "";
+
+    if (document.activeElement !== $("bitrate") && br) {
+      $("bitrate").value = String(br);
+    }
+    pushSample(s);
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch("/api/stats", { cache: "no-store" });
+      if (!r.ok) throw new Error("stats " + r.status);
+      const j = await r.json();
+      state.device = !!j.device;
+      apply(j);
+    } catch {
+      state.device = false;
+    }
+    setLink();
+  }
+
+  async function ctl(cmd) {
+    try {
+      const r = await fetch("/api/control?cmd=" + encodeURIComponent(cmd),
+                            { cache: "no-store" });
+      const j = await r.json();
+      if (j.ok) toast(cmd.toUpperCase() + "  →  sent");
+      else toast(j.error || "rejected", false);
+    } catch {
+      toast("control link failed", false);
+    }
+  }
+
+  $("pauseBtn").onclick = () => ctl(state.stats.paused ? "resume" : "pause");
+  $("clearBtn").onclick = () => ctl("clear");
+  $("modeBtn").onclick = () => ctl("config mode=" +
+    (String(state.stats.mode) === "NORMAL" ? "listen" : "normal"));
+  $("applyBr").onclick = () => ctl("config bitrate=" + $("bitrate").value);
+  $("bitrate").onchange = () => $("applyBr").classList.add("active");
+  $("filter").oninput = () => { state.filter = $("filter").value; render(); };
+  $("freezeBtn").onclick = () => {
+    state.frozen = !state.frozen;
+    $("freezeBtn").textContent = state.frozen ? "Unfreeze" : "Freeze";
+    $("freezeBtn").classList.toggle("active", state.frozen);
+    if (!state.frozen) schedule(); else render();
+  };
+
+  const es = new EventSource("/api/live");
+  es.onopen = () => { state.sse = true; setLink(); };
+  es.onerror = () => { state.sse = false; setLink(); };
+  es.onmessage = (ev) => {
+    try {
+      const batch = JSON.parse(ev.data);
+      ingest(batch);
+    } catch { /* ignore malformed event */ }
+  };
+
+  setLink();
+  poll();
+  setInterval(poll, 1000);
+  window.addEventListener("resize", () => {
+    drawSpark($("fpsChart"), samples.map((x) => x.fps), "#0a84ff",
+              Math.max(1000, ...samples.map((x) => x.fps)));
+    drawSpark($("loadChart"), samples.map((x) => x.load), "#ff9f0a", 100);
+  });
+})();
+</script>
+</body>
+</html>

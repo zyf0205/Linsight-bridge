@@ -12,11 +12,11 @@
 |---|---|---|
 | MCU / RTOS | TWAI 采集、PSRAM ring、双子历史缓冲、Wi-Fi/TCP、任务优先级 | M3.4 / M3.5 |
 | LVGL | 320×240 双页 UI、4 列固定坐标 trace、过滤/触发、跨任务邮箱 | M3.1 的 UI 项 |
-| Linux 系统 | epoll/signalfd/timerfd、非阻塞 socket、Unix socket、写线程 + 有界 ring、二进制日志 | M4 P0、M6 soak |
+| Linux 系统 | epoll/signalfd/timerfd、非阻塞 socket、Unix socket、写线程 + 有界 ring、二进制日志、HTTP/SSE | M4 P0、M5、M6 soak |
 | 工程化 | 共享纯 C 协议、fuzz、ctest/ASan、台架工具、文档单一事实源 | M3.0、M4 CI |
 
-非目标：CAN FD（S3 不支持）、多通道、多设备集群、云端、Web/PySide6 产品 UI
-（主机 UI 采用 CLI-first；`host/gui` 仅是台架测试台）。
+非目标：CAN FD（S3 不支持）、多通道、多设备集群、云端。主机以 CLI 为主，
+Web dashboard 仅作可视化层：无前端框架、无构建步骤，页面由 daemon 直接托管。
 
 ## 2. 仓库与数据流
 
@@ -33,6 +33,8 @@ CAN ── 收发器 ── ESP32-S3
                   ├─ twai_task → PSRAM ring → net_task ─Wi-Fi/TCP→ linsightd → .lsc
                   │            └→ 捕获侧 512 条 UI history → LVGL 20 Hz
                   └─ 触摸 / GPIO0
+                                      linsightd ── Unix socket / TCP → linsight-cli
+                                                └─ HTTP + SSE → 浏览器 dashboard
 ```
 
 ring（约 52k 条）供网络排空，UI history 独立；主机追数据时 trace 不会被抽空。
@@ -41,7 +43,8 @@ ring（约 52k 条）供网络排空，UI history 独立；主机追数据时 tr
 
 M0–M2 已跑通：采集/UI/流式/CONTROL-ACK/daemon/CLI/`.lsc`/导出。ESP32 自测
 30000 帧启动突发 4330 fps、96% 负载零丢失（未触发 ring 溢出）；外部 PCAN 经
-WSL2 SocketCAN 50 fps/10 s、1000 fps/10 s 零丢帧；主机 ctest 7/7、ASan/UBSan 通过。
+WSL2 SocketCAN 50 fps/10 s、1000 fps/10 s 零丢帧；主机 ctest 7/7、ASan/UBSan 通过，
+集成测试覆盖 daemon→CLI/`.lsc` 与 HTTP 页面、SSE、Web 控制。
 
 | 缺陷 | 影响 | 修复 |
 |---|---|---|
@@ -83,11 +86,18 @@ P0（已实现，见 `~/linsight/host`）：
 P1（待做）：systemd/journald/logrotate、DBC（cantools）；物理 PCAN 的 SocketCAN 对照已打通
 （usbipd + `peak_usb` + `can0`，50/1000 fps 零丢帧；3500 fps 待亚毫秒节拍）。
 
-## 6. M5 CLI 深化
+## 6. M5 CLI 深化与 Web 可视化
 
-不新增 Web/PySide6/Tkinter 产品 UI：`live` 增加过滤/着色，`stats --watch` 周期刷新，
-`export` 支持时间与 ID 过滤；全部通过 Unix socket / `--ctl-port` 复用 daemon。
-验收：1 h 连续 `live` 不卡；3000 帧/s 时可抽样核对 CLI 输出。
+CLI：`live` 过滤/着色、`stats --watch` 周期刷新、`export` 时间与 ID 过滤；全部通过
+Unix socket / `--ctl-port` 复用 daemon。验收：1 h 连续 `live` 不卡；3000 帧/s 可抽样核对。
+
+Web：`src/http.c` 在 daemon 的**同一个 epoll 循环**里提供最小 HTTP/1.1 + SSE，
+无第三方库；`host/web/index.html` 单文件（内联 CSS/JS、无构建）展示统计 tile、
+实时帧表、fps/负载 sparkline、Top IDs 与 pause/resume/clear/config 控制。
+`/api/live` 每事件 ≤64 条记录；发送非阻塞，浏览器慢时丢事件而不阻塞采集。
+`/api/control` 只做白名单转发，不等设备 ACK（下一帧 STATS 反映结果）。
+验收：页面 200 且含标题；`/api/stats` 透传设备 JSON（含 `load_permille`）；
+SSE 收到含真实记录的 JSON 数组；暂停/恢复经 CONTROL-ACK 生效；集成测试覆盖以上路径。
 
 ## 7. M6 Soak 与交付
 

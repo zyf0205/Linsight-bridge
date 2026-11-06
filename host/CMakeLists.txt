@@ -19,6 +19,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../protocol)
 add_executable(linsightd
     src/main.c
     src/canlog.c
+    src/http.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
 target_link_libraries(linsightd pthread rt)
 

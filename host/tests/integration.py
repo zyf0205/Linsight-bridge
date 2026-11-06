@@ -48,10 +48,13 @@ def main():
     log_dir = os.path.join(tmp, "logs")
     port = _free_port()
     ctl_port = _free_port()
+    http_port = _free_port()
+    web_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web"))
 
     proc = subprocess.Popen(
         [daemon, "--port", str(port), "--ctl", ctl, "--ctl-port", str(ctl_port),
-         "--log-dir", log_dir],
+         "--log-dir", log_dir, "--http-port", str(http_port),
+         "--http-bind", "127.0.0.1", "--web-dir", web_dir],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
@@ -65,7 +68,7 @@ def main():
                 proc.kill()
 
     try:
-        _run_test(port, ctl_port, ctl, cli, log_dir, proc)
+        _run_test(port, ctl_port, http_port, ctl, cli, log_dir, proc)
     except BaseException:
         _stop_daemon()
         err = proc.stderr.read().decode(errors="replace")
@@ -77,7 +80,7 @@ def main():
     print("integration: all passed")
 
 
-def _run_test(port, ctl_port, ctl, cli, log_dir, proc):
+def _run_test(port, ctl_port, http_port, ctl, cli, log_dir, proc):
     dev = _wait_port(port, proc)
     dev.settimeout(5)
 
@@ -88,6 +91,10 @@ def _run_test(port, ctl_port, ctl, cli, log_dir, proc):
     live.sendall(b"live\n")
     time.sleep(0.2)
 
+    # Dashboard SSE stream, subscribed before any records so the very first
+    # broadcast lands here. Headers arrive immediately.
+    sse, sse_buf = _sse_connect(http_port)
+
     # HELLO, then 10 records in two batches, then STATS.
     dev.sendall(frame(1, b'{"proto":32,"fw":"2.0.0","device":"fake"}'))
     records = [
@@ -97,7 +104,7 @@ def _run_test(port, ctl_port, ctl, cli, log_dir, proc):
     ]
     dev.sendall(batch_frame(records[:6]))
     dev.sendall(batch_frame(records[6:]))
-    dev.sendall(frame(3, b'{"fps":4330,"total":10}'))
+    dev.sendall(frame(3, b'{"fps":4330,"load_permille":123,"total":10}'))
     time.sleep(0.3)
 
     live_data = b""
@@ -115,6 +122,43 @@ def _run_test(port, ctl_port, ctl, cli, log_dir, proc):
     live_text = live_data.decode(errors="replace")
     if "can0" not in live_text or "01ABCDEF" not in live_text or "00000123" not in live_text:
         fail(f"live stream content: {live_text!r}")
+
+    # Dashboard page + JSON stats (same epoll loop as device and CLI).
+    status, head, body = _http_get(http_port, "/")
+    if b"200" not in status or b"text/html" not in head:
+        fail(f"dashboard status/type: {status!r} {head[:120]!r}")
+    if b"LinSight" not in body:
+        fail("dashboard page content missing")
+
+    status, head, body = _http_get(http_port, "/api/stats")
+    if b"200" not in status or b"application/json" not in head:
+        fail(f"stats status/type: {status!r} {head[:120]!r}")
+    js = json.loads(body)
+    if js.get("device") is not True or js.get("records") != 10:
+        fail(f"http stats: {js}")
+    if js.get("stats", {}).get("load_permille") != 123:
+        fail(f"http stats did not relay device payload: {js}")
+
+    # SSE: the batches above must have been broadcast as JSON arrays.
+    ev, sse_buf = _wait_sse_data(sse, sse_buf)
+    batch = json.loads(ev)
+    if not isinstance(batch, list) or not batch:
+        fail(f"sse payload: {ev!r}")
+    hit = [r for r in batch if r.get("i") == 0x123]
+    if not hit:
+        fail(f"sse batch missing 0x123: {batch}")
+    rec = hit[0]
+    if rec.get("b") != "0122334455" or rec.get("d") != 5 or rec.get("f") != 1:
+        fail(f"sse record shape: {rec}")
+
+    # Dashboard control is asynchronous: the daemon forwards CONTROL and the
+    # browser learns the outcome from fresh STATS.
+    _web_control(dev, http_port, "pause")
+    _web_control(dev, http_port, "resume")
+    status, head, body = _http_get(http_port, "/api/control?cmd=nope")
+    if json.loads(body).get("ok") is not False:
+        fail(f"bad control accepted: {body!r}")
+    sse.close()
 
     # stats over the control socket.
     out = _ctl_roundtrip(ctl, b"stats\n")
@@ -281,6 +325,91 @@ def _tcp_roundtrip(port, msg):
             break
     s.close()
     return data.decode(errors="replace")
+
+
+def _http_get(port, path, timeout=5):
+    """One-shot HTTP/1.1 GET; returns (status line, headers, body bytes)."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    s.settimeout(timeout)
+    s.sendall(f"GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+    data = b""
+    while True:
+        try:
+            chunk = s.recv(65536)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    head, sep, body = data.partition(b"\r\n\r\n")
+    if not sep:
+        fail(f"http {path}: no header terminator in {data[:200]!r}")
+    return head.split(b"\r\n", 1)[0], head, body
+
+
+def _sse_connect(port, timeout=5.0):
+    """Open an EventSource-style stream; returns (socket, bytes after headers)."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+            break
+        except OSError:
+            if time.time() > deadline:
+                fail("sse: http listener never accepted")
+            time.sleep(0.05)
+    s.settimeout(timeout)
+    s.sendall(b"GET /api/live HTTP/1.1\r\nHost: localhost\r\n"
+              b"Accept: text/event-stream\r\n\r\n")
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = s.recv(1024)
+        if not chunk:
+            fail("sse: closed before headers")
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    if b"200" not in head.split(b"\r\n", 1)[0] or b"text/event-stream" not in head:
+        fail(f"sse headers: {head!r}")
+    return s, rest
+
+
+def _wait_sse_data(sock, buf, timeout=5.0):
+    """Return (data payload, unread remainder), skipping comment frames."""
+    deadline = time.time() + timeout
+    while True:
+        while b"\n\n" in buf:
+            event, _, buf = buf.partition(b"\n\n")
+            data = b"\n".join(line[5:].lstrip()
+                              for line in event.split(b"\n")
+                              if line.startswith(b"data:"))
+            if data:
+                return data, buf
+        if time.time() > deadline:
+            fail("sse: no data event before timeout")
+        sock.settimeout(max(0.05, deadline - time.time()))
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            fail("sse: no data event before timeout")
+        if not chunk:
+            fail("sse: closed while waiting for data")
+        buf += chunk
+
+
+def _web_control(dev, port, cmd):
+    """Drive one CONTROL through /api/control and ACK it on the device side."""
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_http_get, port, "/api/control?cmd=" + cmd)
+        ftype, payload = _recv_frame(dev)
+        if ftype != 7 or cmd.encode() not in payload:
+            fail(f"expected CONTROL {cmd}, got type={ftype} {payload!r}")
+        _reply_ack(dev, payload)
+        status, head, body = fut.result(timeout=5)
+    if b"200" not in status:
+        fail(f"control {cmd} status: {status!r}")
+    if json.loads(body).get("ok") is not True:
+        fail(f"control {cmd} rejected: {body!r}")
 
 
 def _recv_frame(sock):

@@ -2,7 +2,8 @@
  * linsightd — LinSight CAN host daemon (M2).
  *
  * epoll main loop: TCP listener (the device), Unix-socket listener (the CLI),
- * an optional loopback TCP listener (Windows GUI / remote CLI), signalfd
+ * an optional loopback TCP listener (Windows GUI / remote CLI), a minimal
+ * HTTP + SSE dashboard (web/, epoll clients, no threads), signalfd
  * (SIGTERM/SIGINT graceful exit) and a 1 Hz timerfd (stats).
  * One device session at a time; CAN_BATCH records flow into a bounded ring
  * drained by a writer thread that appends to per-session .lsc files.
@@ -38,6 +39,7 @@
 
 #include "canlog.h"
 #include "frame.h"
+#include "http.h"
 
 #define TAG "linsightd"
 
@@ -51,6 +53,10 @@ static const char *g_port = "8888";
 static const char *g_ctl_path = "/tmp/linsight.sock";
 static const char *g_ctl_port = NULL; /* optional loopback TCP control port */
 static const char *g_log_dir = ".";
+static int g_http_port = 8080;    /* 0 disables the dashboard */
+static const char *g_http_bind = "127.0.0.1";
+static const char *g_web_dir = "web";
+static http_server_t *g_http;
 
 /* ------------------------------------------------------------ write ring */
 
@@ -454,6 +460,11 @@ static void deliver_live(const linsight_can_record_t *recs, uint32_t n)
             cli_close(cli);
         }
     }
+
+    /* Web dashboard gets the unfiltered batch; filtering is client-side. */
+    if (g_http) {
+        http_broadcast_records(g_http, recs, n);
+    }
 }
 
 static void handle_batch(const uint8_t *payload, uint16_t len)
@@ -761,6 +772,66 @@ static bool build_config_fields(const char *args, char *out, size_t cap)
     return any;
 }
 
+static size_t build_stats_json(char *out, size_t cap)
+{
+    pthread_mutex_lock(&g_ring.lock);
+    const uint64_t written = g_ring.written;
+    const uint64_t dropped = g_ring.dropped;
+    pthread_mutex_unlock(&g_ring.lock);
+
+    const int n = snprintf(
+        out, cap,
+        "{\"device\":%s,\"records\":%llu,\"written\":%llu,\"dropped\":%llu,"
+        "\"log\":\"%s\",\"stats\":%s}",
+        g_dev.fd >= 0 ? "true" : "false", (unsigned long long)g_dev.recs,
+        (unsigned long long)written, (unsigned long long)dropped,
+        g_current_log[0] ? g_current_log : "", g_dev.stats[0] ? g_dev.stats : "{}");
+    if (n <= 0) {
+        return 0;
+    }
+    return (size_t)n >= cap ? cap - 1 : (size_t)n;
+}
+
+/* Dashboard control endpoint: same whitelist as the CLI, ACK still goes to the
+ * device (the web UI observes the resulting STATS). */
+static bool web_control(void *ctx, const char *cmd, char *err, size_t errcap)
+{
+    (void)ctx;
+    if (strcmp(cmd, "pause") == 0 || strcmp(cmd, "resume") == 0 ||
+        strcmp(cmd, "clear") == 0) {
+        if (g_dev.fd < 0) {
+            snprintf(err, errcap, "no device");
+            return false;
+        }
+        send_control(g_dev.fd, strcmp(cmd, "clear") == 0 ? "clear_stats" : cmd);
+        return true;
+    }
+    if (strncmp(cmd, "config ", 7) == 0) {
+        char fields[96];
+        if (!build_config_fields(cmd + 7, fields, sizeof(fields))) {
+            snprintf(err, errcap, "bad config");
+            return false;
+        }
+        if (g_dev.fd < 0) {
+            snprintf(err, errcap, "no device");
+            return false;
+        }
+        if (!send_control_fields(g_dev.fd, LINSIGHT_CTRL_CONFIG, fields)) {
+            snprintf(err, errcap, "send failed");
+            return false;
+        }
+        return true;
+    }
+    snprintf(err, errcap, "unknown command");
+    return false;
+}
+
+static size_t web_stats(void *ctx, char *out, size_t cap)
+{
+    (void)ctx;
+    return build_stats_json(out, cap);
+}
+
 static void cli_dispatch(cli_conn_t *c)
 {
     char cmd[64] = {0};
@@ -774,20 +845,10 @@ static void cli_dispatch(cli_conn_t *c)
 
     if (strcmp(cmd, "stats") == 0) {
         char out[1024];
-        pthread_mutex_lock(&g_ring.lock);
-        const uint64_t written = g_ring.written;
-        const uint64_t dropped = g_ring.dropped;
-        pthread_mutex_unlock(&g_ring.lock);
-        const int n = snprintf(
-            out, sizeof(out),
-            "{\"device\":%s,\"records\":%llu,\"written\":%llu,\"dropped\":%llu,"
-            "\"log\":\"%s\",\"stats\":%s}\n",
-            g_dev.fd >= 0 ? "true" : "false", (unsigned long long)g_dev.recs,
-            (unsigned long long)written, (unsigned long long)dropped,
-            g_current_log[0] ? g_current_log : "",
-            g_dev.stats[0] ? g_dev.stats : "{}");
-        size_t out_len =
-            (n <= 0) ? 0 : ((size_t)n >= sizeof(out) ? sizeof(out) - 1 : (size_t)n);
+        size_t out_len = build_stats_json(out, sizeof(out) - 1);
+        if (out_len > 0 && out_len + 1 < sizeof(out)) {
+            out[out_len++] = '\n';
+        }
         send_all(c->fd, out, out_len);
         cli_close(c);
     } else if (strcmp(cmd, "live") == 0 ||
@@ -943,10 +1004,23 @@ int main(int argc, char **argv)
             g_ctl_port = argv[i];
         } else if (strcmp(argv[i], "--log-dir") == 0 && i + 1 < argc) {
             g_log_dir = argv[++i];
+        } else if (strcmp(argv[i], "--http-port") == 0 && i + 1 < argc) {
+            const int p = atoi(argv[++i]);
+            if (p < 0 || p > 65535) {
+                fprintf(stderr, "linsightd: bad http port '%s'\n", argv[i]);
+                return 1;
+            }
+            g_http_port = p; /* 0 disables the dashboard */
+        } else if (strcmp(argv[i], "--http-bind") == 0 && i + 1 < argc) {
+            g_http_bind = argv[++i];
+        } else if (strcmp(argv[i], "--web-dir") == 0 && i + 1 < argc) {
+            g_web_dir = argv[++i];
         } else {
             fprintf(stderr,
                     "usage: linsightd [--port N] [--ctl PATH] [--ctl-port N] "
-                    "[--log-dir DIR]\n");
+                    "[--log-dir DIR]\n"
+                    "                  [--http-port N] [--http-bind ADDR] "
+                    "[--web-dir DIR]\n");
             return 1;
         }
     }
@@ -1005,6 +1079,14 @@ int main(int argc, char **argv)
     ev.data.u64 = 4; /* timer */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, tfd, &ev);
 
+    if (g_http_port > 0) {
+        g_http = http_server_new(g_epoll, g_http_bind, (uint16_t)g_http_port, g_web_dir,
+                                 web_stats, web_control, NULL);
+        if (!g_http) {
+            fprintf(stderr, TAG ": web dashboard disabled (listen failed)\n");
+        }
+    }
+
     pthread_t writer;
     if (pthread_create(&writer, NULL, writer_thread, NULL) != 0) {
         fprintf(stderr, TAG ": writer thread failed\n");
@@ -1015,6 +1097,10 @@ int main(int argc, char **argv)
             g_log_dir);
     if (ctl_tcp_fd >= 0) {
         fprintf(stderr, TAG ": tcp control on 127.0.0.1:%s\n", g_ctl_port);
+    }
+    if (g_http) {
+        fprintf(stderr, TAG ": web dashboard on http://%s:%d (web-dir %s)\n",
+                g_http_bind, g_http_port, g_web_dir);
     }
 
     uint64_t last_recs = 0;
@@ -1076,6 +1162,12 @@ int main(int argc, char **argv)
                     fprintf(stderr, TAG ": protocol error, closing device\n");
                     device_close();
                 }
+            } else if (tag == HTTP_TAG_LISTEN) {
+                http_server_accept(g_http);
+            } else if (tag >= HTTP_TAG_CLIENT_BASE &&
+                       tag < HTTP_TAG_CLIENT_BASE + HTTP_MAX_CLIENTS) {
+                http_server_handle(g_http, (int)(tag - HTTP_TAG_CLIENT_BASE),
+                                   events[i].events);
             } else { /* cli conn */
                 const ssize_t got =
                     recv(cli->fd, cli->buf + cli->len, sizeof(cli->buf) - (size_t)cli->len, 0);
@@ -1097,6 +1189,8 @@ int main(int argc, char **argv)
             cli_close(&g_cli[i]);
         }
     }
+    http_server_free(g_http);
+    g_http = NULL;
     pthread_mutex_lock(&g_ring.lock);
     g_ring.done = true;
     pthread_cond_signal(&g_ring.cond);
