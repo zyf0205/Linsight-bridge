@@ -97,7 +97,7 @@ USB-CAN            CAN_H ── 收发器 CANH
 - 台架改用 **WSL2 SocketCAN**：管理员 `usbipd bind --busid 2-1` 一次；每次拔插/WSL 重启后 `usbipd attach --wsl --busid 2-1`。WSL 内 `sudo modprobe peak_usb`、
   `sudo ip link set can0 type can bitrate 500000 && sudo ip link set can0 up`；
   `cangen can0 -n 500 -g 20 -I 0x123 -L 8` 发帧，以设备 `total` 为判据（不依赖回显）。
-  实测 50 fps/10 s +500、1000 fps/3 s +3000，`missed/rxq_full/dropped` 全 0；3500 fps 待亚毫秒节拍。
+  实测 50 fps/10 s +500；PCAN-USB 经 usbip 约 1 ms/帧，持续上限约 830–920 fps，`missed/rxq_full/dropped` 全 0。
 
 ## 6. sdkconfig 必改
 
