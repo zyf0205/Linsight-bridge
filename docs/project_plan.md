@@ -94,7 +94,7 @@ SSE 每事件 ≤64 条、发送非阻塞（慢浏览器丢事件）；`/api/con
 
 ## 7. M6 Soak 与交付
 
-24 h soak：800 fps 约 1.4 GB；`tools/soak24h.py` 已启动后台长跑，报告在 `~/can-logs/soak-latest`。
+24 h soak：800 fps 约 1.4 GB；本轮按用户要求不执行，`tools/soak24h.py` 留作可选长跑。
 交付：`host/README.md`、接线图、CHANGELOG、tag v0.2.0；简历数字按实测回填。
 
 ## 8. 工程约定
@@ -116,5 +116,5 @@ SSE 每事件 ≤64 条、发送非阻塞（慢浏览器丢事件）；`/api/con
 > **LinSight CAN — 无线 CAN 总线分析仪（ESP32-S3 + Linux）**
 > - TWAI 采集 + PSRAM ring + 时间戳；LVGL 触摸屏 20 fps 实时 trace/负载/错误。
 > - Linux C 守护进程：epoll + 非阻塞 TCP + 写线程 + 二进制日志/ASC 导出 + CLI。
-> - 10.9 min 连续 60 万帧零丢帧（计数器逐帧校验）、1 Mbps 稳定、bus-off 自愈；24 h 长跑中。
+> - 10.9 min 连续 60 万帧零丢帧（计数器逐帧校验）、1 Mbps 稳定、bus-off 自愈；24 h 长跑可选。
 > - 共享协议解析器 fuzz + ctest/ASan CI；SocketCAN 回放与双路对照（M4）。
