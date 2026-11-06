@@ -257,11 +257,25 @@ static void *writer_thread(void *arg)
 
             if (lsc_writer_write(&w, &e->rec) != 0) {
                 fprintf(stderr, TAG ": log write failed: %s\n", strerror(errno));
+                /* The stream is in an error state; close it so the failure
+                 * does not repeat for every remaining record. These records
+                 * are counted as dropped below and the next session starts a
+                 * fresh file. */
+                lsc_writer_close(&w);
+                log_open = false;
                 break;
             }
             ok++;
         }
 
+        if (ok < n) {
+            /* Includes log-open failures, stale generations and write errors:
+             * `dropped` is the total number of records that never reached a
+             * .lsc file, not just ring overflow. */
+            pthread_mutex_lock(&g_ring.lock);
+            g_ring.dropped += n - ok;
+            pthread_mutex_unlock(&g_ring.lock);
+        }
         if (ok > 0) {
             pthread_mutex_lock(&g_ring.lock);
             g_ring.written += ok;

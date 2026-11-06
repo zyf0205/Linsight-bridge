@@ -39,10 +39,14 @@
 ```
 
 - 顶栏：总线胶囊（ACTIVE/PASSIVE/BUS-OFF/STOPPED）、比特率（`500K`，只听加 ` LO`）、
-  运行态（RUN/PAUSED/TRIG'D/STOP）、主机链路（`HOST <rtt>ms` 或 `LOCAL`）、设置按钮。
+  运行态（RUN/PAUSED/TRIG'D/STOP）、主机链路（`WIFI`→`LINK`→`HOST <rtt>ms`，
+  断线重试显示 `RETRY`）、设置按钮。
 - Trace：`ID` 标准帧 3 位/扩展帧 8 位十六进制；`L` 为 DLC，RTR 显示 `R`；
   `DATA` 最多 23 字符；`CNT` 为按 ID 计数（128 槽），超 10000 缩写为 `14.2k`。
+  锁定行左侧有 3 px 蓝色竖条；无匹配帧时覆盖提示 `Waiting for CAN frames /
+  check wiring / bitrate`。
 - 底栏：`FPS`、`LOAD`（≥75% 橙色）、`ERR TEC/REC`（≥128 红）、`OVF`（>0 红）。
+- 操作反馈：比特率/模式切换、Clear、Recover、锁定 ID 在底栏上方弹出 1.4 s toast。
 
 ## 4. Settings 布局
 
