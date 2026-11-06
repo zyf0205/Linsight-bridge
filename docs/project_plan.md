@@ -23,12 +23,10 @@
 | 路径 | 内容 |
 |---|---|
 | `main/` | 固件：`twai.c` 采集、`can_ring.c` PSRAM ring、`net.c` 流式、`ui.c` LVGL、`bsp.c` 板级 |
-| `protocol/` | `frame.h/.c` 协议 v2.0，纯 C、无 IDF/分配，固件与主机共用 |
-| `host/src/` | `linsightd`：epoll 主循环、设备 TCP、控制口、writer 线程、`.lsc` |
-| `host/cli/`、`host/gui/` | `linsight-cli` 工具；Windows Tkinter 台架 GUI（legacy；主台架已转 WSL SocketCAN） |
-| `host/tests/` | 单元、协议 fuzz、Python 集成、ring 回归、GUI TX 冒烟 |
-| `tools/can_probe/` | M0 接线验证用 TWAI 探针；`tools/bench_can.py` 台架收发 |
+| `protocol/` | `frame.h/.c` 协议 v2.0，纯 C、无 IDF/分配；固件仓与上位机仓各一份，改动需同步 |
+| `tools/can_probe/` | M0 接线验证用 TWAI 探针 |
 | `docs/` | 计划、硬件、UI；根目录只有 `CLAUDE.md` |
+| `~/linsight`（WSL 上位机仓） | `host/`（daemon/CLI/tests）、`tools/bench_can.py`、协议与文档镜像 |
 
 ```text
 CAN ── 收发器 ── ESP32-S3
@@ -102,7 +100,8 @@ P1：systemd/journald/logrotate、DBC（cantools）；物理 PCAN 的 SocketCAN 
   `. 'C:\Espressif\tools\Microsoft.v5.5.4.PowerShell_profile.ps1'; idf.py build`。
 - 上位机只在 WSL `~/linsight` 开发/构建/运行；Windows 不构建 `host/`：
   `cd ~/linsight/host && cmake -S . -B build && cmake --build build -j"$(nproc)"`。
-- 台架 GUI 为 legacy；主台架用 WSL `can0`（见 [hardware.md](hardware.md) §5）。
+- 本仓库只提交固件；上位机在 `~/linsight` 单独提交；`protocol/`、`docs/` 改动两边同步。
+- 台架用 WSL `can0`（见 [hardware.md](hardware.md) §5）；Python 台架工具留在上位机仓。
 - 文档只放 `docs/`；协议以 `protocol/frame.h` 为准，不复制表格。
 - Wi-Fi 密码与主机 IP 只存在于忽略的 `sdkconfig`。
 - 不提交 `build/`、`sdkconfig`、`managed_components/`；提交信息用中文。

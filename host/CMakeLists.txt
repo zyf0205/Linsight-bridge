@@ -29,11 +29,11 @@ add_executable(test_parser tests/test_parser.c ${CMAKE_CURRENT_SOURCE_DIR}/../pr
 add_executable(test_fuzz tests/test_fuzz.c ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
 # Firmware ring compiled against tiny ESP-IDF shims: verifies drop-oldest order.
 add_executable(test_ring tests/test_ring.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../main/can_ring.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../firmware/can_ring.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
 target_include_directories(test_ring PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/shims
-    ${CMAKE_CURRENT_SOURCE_DIR}/../main)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../firmware)
 add_test(NAME record COMMAND test_record)
 add_test(NAME parser COMMAND test_parser)
 add_test(NAME fuzz COMMAND test_fuzz)
