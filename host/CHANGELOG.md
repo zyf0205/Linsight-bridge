@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Built-in traffic simulator (`src/sim.c`): `engine`/`bms`/`mix`/`counter`
+  patterns at 1–1000 fps plus one-shot inject, driven from a 10 Hz timerfd in
+  the daemon's epoll loop. Simulated frames reuse the real ingest path (writer
+  ring, CLI `live`, SSE) and carry a monotone `seq`, so `verify --strict` is
+  clean. No hardware and no device needed; sim traffic never reaches the bus.
+- CLI `sim start|stop|status|inject`; dashboard Simulate row; `sim` object in
+  `/api/stats` and `linsight-cli stats`.
+- One-shot USB-CAN bench bring-up: `tools/can-up.sh` / `tools/can-down.sh`
+  wrap `usbipd attach`, `modprobe peak_usb`, bitrate configuration and
+  `ip link set can0 up`, with `--status` for diagnostics.
+- `test_sim` added; suite is 13 tests.
+
 ## v0.3.0 — 2026-11-08
 
 - Protocol v2.1 (additive): `DEVICE_INFO` type 10, HELLO `device_id`/`boot`/
