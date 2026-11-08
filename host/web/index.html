@@ -279,6 +279,23 @@ footer{
     <button class="btn" id="modeBtn">Mode</button>
     <button class="btn" id="pauseBtn">Pause</button>
     <button class="btn danger" id="clearBtn">Clear</button>
+    <span class="sep"></span>
+    <div class="ctlgroup">
+      <label for="simPattern">Simulate</label>
+      <select id="simPattern" title="Built-in traffic patterns (no device needed)">
+        <option value="engine">engine ECU</option>
+        <option value="bms">battery BMS</option>
+        <option value="mix" selected>vehicle mix</option>
+        <option value="counter">soak counter</option>
+      </select>
+      <input id="simRate" type="number" min="1" max="1000" value="50" style="width:64px"
+             title="Aggregate frames per second (1..1000)">
+      <button class="btn" id="simStartBtn">Start</button>
+      <button class="btn" id="simStopBtn" style="display:none">Stop</button>
+      <button class="btn" id="simInjectBtn" title="Inject one frame now">Inject</button>
+      <input id="simInjectId" placeholder="0x1AB" value="0x1AB" spellcheck="false" autocomplete="off" style="width:72px">
+      <span class="dim mono" id="simState" style="font-size:11px"></span>
+    </div>
     <div class="spacer"></div>
     <div class="seg" id="typeSeg">
       <button class="active" data-t="ALL">ALL</button>
@@ -640,6 +657,21 @@ footer{
     $("logPath").textContent = j.log || "";
 
     if (document.activeElement !== $("bitrate") && br) $("bitrate").value = String(br);
+
+    /* Simulator state rides along in the stats JSON. */
+    const sim = j.sim || {};
+    const running = !!sim.running;
+    $("simStartBtn").style.display = running ? "none" : "";
+    $("simStopBtn").style.display = running ? "" : "none";
+    $("simState").textContent = running
+      ? `${sim.pattern} @ ${sim.rate} fps · ${fmt(sim.generated || 0)}`
+      : "";
+    if (running && document.activeElement !== $("simPattern")) {
+      $("simPattern").value = sim.pattern || "mix";
+    }
+    if (running && document.activeElement !== $("simRate")) {
+      $("simRate").value = sim.rate || 50;
+    }
     pushSample(s);
   }
 
@@ -675,6 +707,17 @@ footer{
   $("modeBtn").onclick = () => ctl("config mode=" + (String(state.stats.mode) === "NORMAL" ? "listen" : "normal"));
   $("applyBr").onclick = () => ctl("config bitrate=" + $("bitrate").value);
   $("bitrate").onchange = () => $("applyBr").classList.add("active");
+
+  $("simStartBtn").onclick = () => {
+    const rate = Math.max(1, Math.min(1000, Number($("simRate").value) || 50));
+    ctl("sim start " + $("simPattern").value + " " + rate);
+    poll();
+  };
+  $("simStopBtn").onclick = () => { ctl("sim stop"); poll(); };
+  $("simInjectBtn").onclick = () => {
+    const id = ($("simInjectId").value || "0x1AB").trim();
+    ctl("sim inject " + id.replace(/^0x/i, ""));
+  };
   $("filter").oninput = () => { state.filter = $("filter").value; render(); };
 
   const toggleFreeze = () => {

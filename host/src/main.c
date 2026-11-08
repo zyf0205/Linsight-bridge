@@ -12,6 +12,7 @@
  *   stats   -> one JSON status line, socket closes
  *   live    -> candump lines streamed until the client disconnects
  *   pause / resume / clear -> forwarded to the device as CONTROL, ACK echoed
+ *   sim ... -> built-in traffic simulator (see sim.h), no device needed
  */
 
 #include <dirent.h>
@@ -42,6 +43,7 @@
 #include "frame.h"
 #include "http.h"
 #include "session.h"
+#include "sim.h"
 
 #define TAG "linsightd"
 
@@ -164,6 +166,54 @@ static void wring_set_log_error(const char *msg)
     pthread_mutex_lock(&g_ring.lock);
     snprintf(g_ring.log_error, sizeof(g_ring.log_error), "%s", msg ? msg : "");
     pthread_mutex_unlock(&g_ring.lock);
+}
+
+/* Ask the writer to open a fresh session log. Callers: a real device session
+ * and the simulator's first emit (no device). Bumping gen rotates: the writer
+ * closes the previous file at the generation boundary. */
+static void wring_request_open(const char *why)
+{
+    pthread_mutex_lock(&g_ring.lock);
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    /* Monotonic suffix: two sessions in the same second must not truncate
+     * each other's log. */
+    static uint32_t session_seq;
+    session_seq++;
+    g_ring.gen++;
+    g_ring.open_gen = g_ring.gen;
+    snprintf(g_ring.open_path, sizeof(g_ring.open_path),
+             "%s/can-%04d%02d%02d-%02d%02d%02d-%03u.lsc", g_log_dir, tm.tm_year + 1900,
+             tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, session_seq);
+    snprintf(g_current_log, sizeof(g_current_log), "%s", g_ring.open_path);
+    g_ring.open_req = true;
+    pthread_cond_signal(&g_ring.cond);
+    pthread_mutex_unlock(&g_ring.lock);
+    fprintf(stderr, TAG ": %s session, logging to %s\n", why, g_current_log);
+}
+
+/* Simulator-only helper: open one session log lazily on the first emitted
+ * record, so `sim` traffic reaches the .lsc writer without a device. A real
+ * device connection always takes precedence (sim_emit defers to its session),
+ * and sim_allow_reopen() re-arms this after the device disconnects. */
+static bool s_sim_log_open;
+
+/* device_t lives further down; both helpers only need g_dev.fd. */
+static bool device_connected(void);
+
+static void sim_request_open(void)
+{
+    if (s_sim_log_open || device_connected()) {
+        return;
+    }
+    s_sim_log_open = true;
+    wring_request_open("sim");
+}
+
+static void sim_allow_reopen(void)
+{
+    s_sim_log_open = false;
 }
 
 /* Close the log of `gen` if the device session is over. A close request for a
@@ -551,6 +601,11 @@ static cli_conn_t g_cli[CLI_MAX];
 static int g_epoll = -1;
 static volatile sig_atomic_t g_stop;
 static uint16_t g_ctrl_id;
+
+static bool device_connected(void)
+{
+    return g_dev.fd >= 0;
+}
 static uint64_t g_session_start_ms;
 
 static void set_nonblock(int fd)
@@ -827,6 +882,34 @@ static void handle_batch(const uint8_t *payload, uint16_t len)
     }
 }
 
+/* Simulator ingest: bypass device-session dedupe/anchor (those guard real
+ * reconnect backlogs) but reuse the writer ring, live clients and SSE, so
+ * simulated traffic is indistinguishable from device traffic downstream. */
+static void sim_emit(void *ctx, const linsight_can_record_t *recs, uint32_t n)
+{
+    (void)ctx;
+    if (!g_dev.anchor_valid) {
+        /* Same wall-clock mapping as a first batch from old firmware. */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u +
+                                (uint64_t)ts.tv_nsec / 1000000u;
+        g_dev.anchor_wall_ms = now_ms > recs[0].ts_ms ? now_ms - recs[0].ts_ms : 0;
+        g_dev.anchor_valid = true;
+        g_session_start_ms = g_dev.anchor_wall_ms;
+        wring_set_anchor_info(g_dev.anchor_wall_ms, g_dev.boot_count);
+    }
+    if (g_dev.fd < 0) {
+        /* No device session owns the writer: open a sim session log so the
+         * records land in a .lsc instead of overflowing the ring. When a real
+         * device connects later its own open request rotates to a new file. */
+        sim_request_open();
+    }
+    g_dev.recs += n;
+    wring_push(recs, n);
+    deliver_live(recs, n);
+}
+
 static void handle_frame(void *ctx, uint8_t type, const uint8_t *payload, uint16_t len)
 {
     (void)ctx;
@@ -919,6 +1002,7 @@ static void device_close(void)
     g_dev.fd = -1;
     g_dev.out_off = 0;
     g_dev.out_len = 0;
+    g_dev.anchor_valid = false; /* a later sim_emit re-anchors its own session */
     fprintf(stderr, TAG ": device session ended (%llu records)\n",
             (unsigned long long)g_dev.recs);
     pthread_mutex_lock(&g_ring.lock);
@@ -927,6 +1011,9 @@ static void device_close(void)
     g_current_log[0] = '\0';
     pthread_cond_signal(&g_ring.cond);
     pthread_mutex_unlock(&g_ring.lock);
+    /* The sim session may outlive this device session: let its next emit
+     * open a fresh log instead of piling onto a closed generation. */
+    sim_allow_reopen();
 }
 
 static void device_accept(int listen_fd)
@@ -957,27 +1044,8 @@ static void device_accept(int listen_fd)
     struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 0}; /* u64 0 = device */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, fd, &ev);
 
-    char announced[512];
-    pthread_mutex_lock(&g_ring.lock);
-    time_t t = time(NULL);
-    struct tm tm;
-    localtime_r(&t, &tm);
-    /* Monotonic suffix: two sessions in the same second must not truncate
-     * each other's log. */
-    static uint32_t session_seq;
-    session_seq++;
-    g_ring.gen++;
-    g_ring.open_gen = g_ring.gen;
-    snprintf(g_ring.open_path, sizeof(g_ring.open_path),
-             "%s/can-%04d%02d%02d-%02d%02d%02d-%03u.lsc", g_log_dir, tm.tm_year + 1900,
-             tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, session_seq);
-    snprintf(g_current_log, sizeof(g_current_log), "%s", g_ring.open_path);
-    snprintf(announced, sizeof(announced), "%s", g_current_log);
-    g_ring.open_req = true;
-    pthread_cond_signal(&g_ring.cond);
-    pthread_mutex_unlock(&g_ring.lock);
-
-    fprintf(stderr, TAG ": device connected, logging to %s\n", announced);
+    wring_request_open("device");
+    fprintf(stderr, TAG ": device connected, logging to %s\n", g_current_log);
 }
 
 static void cli_close(cli_conn_t *c)
@@ -1107,25 +1175,125 @@ static size_t build_stats_json(char *out, size_t cap)
     snprintf(log_error, sizeof(log_error), "%s", g_ring.log_error);
     pthread_mutex_unlock(&g_ring.lock);
 
+    sim_status_t sim;
+    sim_status(&sim);
+    char sim_json[160];
+    const int sn = snprintf(sim_json, sizeof(sim_json),
+                            "{\"running\":%s,\"pattern\":\"%s\",\"rate\":%u,"
+                            "\"generated\":%llu}",
+                            sim.running ? "true" : "false",
+                            sim_pattern_name(sim.pattern), sim.rate_fps,
+                            (unsigned long long)sim.generated);
+    if (sn < 0 || (size_t)sn >= sizeof(sim_json)) {
+        sim_json[0] = '\0';
+    }
+
     const int n = snprintf(
         out, cap,
         "{\"version\":\"0.3.0\",\"device\":%s,\"device_id\":\"%s\",\"boot\":%u,"
         "\"records\":%llu,\"recv_raw\":%llu,\"backlog_skipped\":%llu,"
         "\"seq_gaps\":%llu,\"seq_missing\":%llu,\"seq_ambiguous\":%llu,"
         "\"written\":%llu,\"dropped\":%llu,\"log\":\"%s\",\"log_error\":\"%s\","
-        "\"anchor_wall_ms\":%llu,\"stats\":%s,\"info\":%s}",
+        "\"anchor_wall_ms\":%llu,\"stats\":%s,\"info\":%s,\"sim\":%s}",
         g_dev.fd >= 0 ? "true" : "false", g_dev.device_id, (unsigned)g_dev.boot_count,
-        (unsigned long long)g_dev.sess.accepted, (unsigned long long)g_dev.recs,
+        /* "records" counts device-session accepted records + simulated ones;
+         * recv_raw stays the raw device-side counter. */
+        (unsigned long long)(g_dev.sess.accepted + sim.generated),
+        (unsigned long long)g_dev.recs,
         (unsigned long long)g_dev.sess.skipped, (unsigned long long)g_dev.sess.gaps,
         (unsigned long long)g_dev.sess.missing, (unsigned long long)g_dev.sess.ambiguous,
         (unsigned long long)written, (unsigned long long)dropped,
         log_path[0] ? log_path : "", log_error,
         (unsigned long long)g_dev.anchor_wall_ms,
-        g_dev.stats[0] ? g_dev.stats : "{}", g_dev.info[0] ? g_dev.info : "{}");
+        g_dev.stats[0] ? g_dev.stats : "{}", g_dev.info[0] ? g_dev.info : "{}",
+        sim_json[0] ? sim_json : "{}");
     if (n <= 0 || (size_t)n >= cap) {
         return 0;
     }
     return (size_t)n;
+}
+
+/* Shared simulator command parser for the CLI and the web dashboard.
+ * Grammar (space separated):
+ *   sim start <pattern> [rate]   patterns: engine|bms|mix|counter, rate 1..1000
+ *   sim stop
+ *   sim status
+ *   sim inject <id> [ext] [rtr] [dlc] [hexbytes]   id hex, e.g. 0x1AB
+ * Returns false and fills err on a bad command. */
+static bool sim_command(const char *args, char *err, size_t errcap)
+{
+    char pattern[16] = {0};
+    unsigned rate = 0;
+
+    if (strcmp(args, "stop") == 0) {
+        sim_stop();
+        return true;
+    }
+    if (strcmp(args, "status") == 0 || args[0] == '\0') {
+        return true; /* status rides on the stats JSON both callers print */
+    }
+    if (sscanf(args, "start %15s %u", pattern, &rate) == 2 ||
+        sscanf(args, "start %15s", pattern) == 1) {
+        if (rate == 0) {
+            rate = 50u; /* default: a busy-looking but gentle bus */
+        }
+        if (!sim_start(pattern, rate, sim_emit, NULL)) {
+            sim_status_t st;
+            sim_status(&st);
+            snprintf(err, errcap, "%s", st.last_error[0] ? st.last_error : "start failed");
+            return false;
+        }
+        return true;
+    }
+    if (strncmp(args, "inject ", 7) == 0) {
+        const char *p = args + 7;
+        char *end = NULL;
+        const unsigned long id = strtoul(p, &end, 16);
+        if (end == p || id > 0x1FFFFFFFUL) {
+            snprintf(err, errcap, "bad id");
+            return false;
+        }
+        bool ext = id > 0x7FFUL;
+        bool rtr = false;
+        p = end;
+        while (*p == ' ') {
+            p++;
+        }
+        if (strncmp(p, "ext", 3) == 0) {
+            ext = true;
+            p += 3;
+        }
+        while (*p == ' ') {
+            p++;
+        }
+        if (strncmp(p, "rtr", 3) == 0) {
+            rtr = true;
+            p += 3;
+        }
+        uint8_t data[LINSIGHT_DLC_MAX] = {0};
+        uint8_t dlc = 0;
+        if (!rtr) {
+            for (; dlc < LINSIGHT_DLC_MAX && p[0] && p[1]; dlc++) {
+                const unsigned byte = (unsigned)strtoul(p, &end, 16);
+                if (end != p + 2 || byte > 0xFFu) {
+                    snprintf(err, errcap, "bad data hex");
+                    return false;
+                }
+                data[dlc] = (uint8_t)byte;
+                p = end;
+                while (*p == ' ') {
+                    p++;
+                }
+            }
+        }
+        if (!sim_inject((uint32_t)id, ext, rtr, dlc, data, sim_emit, NULL)) {
+            snprintf(err, errcap, "inject failed");
+            return false;
+        }
+        return true;
+    }
+    snprintf(err, errcap, "bad sim command");
+    return false;
 }
 
 /* Dashboard control endpoint: same whitelist as the CLI, ACK still goes to the
@@ -1141,6 +1309,10 @@ static bool web_control(void *ctx, const char *cmd, char *err, size_t errcap)
         }
         send_control(strcmp(cmd, "clear") == 0 ? "clear_stats" : cmd);
         return true;
+    }
+    if (strncmp(cmd, "sim", 3) == 0 &&
+        (cmd[3] == '\0' || cmd[3] == ' ')) {
+        return sim_command(cmd[3] == ' ' ? cmd + 4 : "", err, errcap);
     }
     if (strncmp(cmd, "config ", 7) == 0) {
         char fields[96];
@@ -1199,6 +1371,34 @@ static void cli_dispatch(cli_conn_t *c)
             return;
         }
         c->live = true; /* records stream until the client goes away */
+    } else if (strncmp(cmd, "sim", 3) == 0 &&
+               (cmd[3] == '\0' || cmd[3] == ' ')) {
+        char err[128] = {0};
+        if (!sim_command(cmd[3] == ' ' ? cmd + 4 : "", err, sizeof(err))) {
+            cli_reply(c, err[0] ? err : "ERR sim failed\n");
+            return;
+        }
+        /* Echo the command plus the resulting state; the full sim JSON rides
+         * on `stats` / /api/stats. */
+        sim_status_t st;
+        sim_status(&st);
+        char out[192];
+        int n;
+        if (strncmp(cmd, "inject", 6) == 0) {
+            n = snprintf(out, sizeof(out), "OK inject");
+        } else if (strncmp(cmd, "start", 5) == 0) {
+            n = snprintf(out, sizeof(out), "OK sim %s @ %u fps", sim_pattern_name(st.pattern),
+                         st.rate_fps);
+        } else {
+            n = snprintf(out, sizeof(out), "OK sim %s",
+                         st.running ? "running" : "stopped");
+        }
+        if (n > 0 && (size_t)n < sizeof(out) - 1) {
+            n += snprintf(out + n, sizeof(out) - (size_t)n, " (%llu generated)\n",
+                          (unsigned long long)st.generated);
+        }
+        (void)n;
+        cli_reply(c, out);
     } else if (strncmp(cmd, "config", 6) == 0 &&
                (cmd[6] == '\0' || cmd[6] == ' ')) {
         char fields[96];
@@ -1450,6 +1650,21 @@ int main(int argc, char **argv)
     ev.data.u64 = 4; /* timer */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, tfd, &ev);
 
+    /* 10 Hz simulator tick: emits frames into the same ingest path as the
+     * device; no-op (one epoll wakeup per 100 ms) while not running. */
+    const int simfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (simfd < 0) {
+        fprintf(stderr, TAG ": sim timerfd failed: %s\n", strerror(errno));
+        return 1;
+    }
+    struct itimerspec sim_its = {
+        .it_interval = {.tv_nsec = 100 * 1000 * 1000L},
+        .it_value = {.tv_nsec = 100 * 1000 * 1000L},
+    };
+    timerfd_settime(simfd, 0, &sim_its, NULL);
+    ev.data.u64 = 6; /* sim tick */
+    epoll_ctl(g_epoll, EPOLL_CTL_ADD, simfd, &ev);
+
     if (g_http_port > 0) {
         g_http = http_server_new(g_epoll, g_http_bind, (uint16_t)g_http_port, g_web_dir,
                                  web_stats, web_control, NULL);
@@ -1525,6 +1740,11 @@ int main(int argc, char **argv)
                     cc->ack_deadline_ms = 0;
                     cli_reply(cc, "ERR ack timeout\n");
                 }
+            } else if (tag == 6) { /* 10 Hz simulator tick */
+                uint64_t misses;
+                while (read(simfd, &misses, sizeof(misses)) == sizeof(misses)) {
+                }
+                sim_tick(sim_emit, NULL);
             } else if (tag == 1) {
                 device_accept(tcp_fd);
             } else if (tag == 2) {

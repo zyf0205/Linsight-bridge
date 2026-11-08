@@ -54,6 +54,8 @@ static void usage(void)
             "       linsight-cli live [--id ID] [--ext|--std] [--color]\n"
             "       linsight-cli config [--bitrate N] [--mode listen|normal|selftest]\n"
             "       linsight-cli pause [--lease MS] | resume | clear\n"
+            "       linsight-cli sim start engine|bms|mix|counter [RATE] | stop | status\n"
+            "       linsight-cli sim inject ID [ext] [rtr] [HEXBYTES]\n"
             "       linsight-cli export asc|candump FILE.lsc [-o OUT]\n"
             "                         [--id ID] [--ext|--std] [--from EPOCH] [--to EPOCH]\n"
             "       linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]\n"
@@ -374,6 +376,77 @@ static int cmd_live(int argc, char **argv)
     }
     fclose(in); /* closes fd */
     return 0;
+}
+
+/* Simulator control: sim start/stop/status/inject ride the same control
+ * socket; the daemon replies with a plain "OK ..." line (no ACK involved). */
+static int cmd_sim(int argc, char **argv)
+{
+    if (argc < 3) {
+        fprintf(stderr, "usage: linsight-cli sim start engine|bms|mix|counter [RATE]\n"
+                        "       linsight-cli sim stop\n"
+                        "       linsight-cli sim status\n"
+                        "       linsight-cli sim inject ID [ext] [rtr] [DLC] [HEXBYTES]\n");
+        return 1;
+    }
+
+    char cmd[160];
+    int n = 0;
+    if (strcmp(argv[2], "start") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "linsight-cli: sim start needs a pattern\n");
+            return 1;
+        }
+        const char *pattern = argv[3];
+        if (strcmp(pattern, "engine") != 0 && strcmp(pattern, "bms") != 0 &&
+            strcmp(pattern, "mix") != 0 && strcmp(pattern, "counter") != 0) {
+            fprintf(stderr, "linsight-cli: pattern must be engine|bms|mix|counter\n");
+            return 1;
+        }
+        unsigned rate = 50;
+        if (argc > 4 && !parse_u32(argv[4], 1000u, &rate)) {
+            fprintf(stderr, "linsight-cli: RATE must be 0..1000\n");
+            return 1;
+        }
+        n = snprintf(cmd, sizeof(cmd), "sim start %s %u", pattern, rate);
+    } else if (strcmp(argv[2], "stop") == 0) {
+        n = snprintf(cmd, sizeof(cmd), "sim stop");
+    } else if (strcmp(argv[2], "status") == 0) {
+        n = snprintf(cmd, sizeof(cmd), "sim status");
+    } else if (strcmp(argv[2], "inject") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "linsight-cli: sim inject needs an ID (hex)\n");
+            return 1;
+        }
+        uint32_t id;
+        /* Accept hex with or without 0x (base 16 either way: CAN IDs are hex
+         * by convention), e.g. "1AB" or "0x1AB". */
+        char idbuf[16];
+        snprintf(idbuf, sizeof(idbuf), "%s", argv[3]);
+        if (strncasecmp(idbuf, "0x", 2) == 0) {
+            memmove(idbuf, idbuf + 2, strlen(idbuf + 2) + 1);
+        }
+        char *end = NULL;
+        errno = 0;
+        const unsigned long v = strtoul(idbuf, &end, 16);
+        if (errno || end == idbuf || *end != '\0' || v > 0x1FFFFFFFUL) {
+            fprintf(stderr, "linsight-cli: bad ID '%s' (hex, max 1FFFFFFF)\n", argv[3]);
+            return 1;
+        }
+        id = (uint32_t)v;
+        n = snprintf(cmd, sizeof(cmd), "sim inject %X", id);
+        for (int i = 4; i < argc && n > 0 && n < (int)sizeof(cmd); i++) {
+            n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, " %s", argv[i]);
+        }
+    } else {
+        fprintf(stderr, "linsight-cli: unknown sim subcommand '%s'\n", argv[2]);
+        return 1;
+    }
+    if (n <= 0 || n >= (int)sizeof(cmd)) {
+        fprintf(stderr, "linsight-cli: sim command too long\n");
+        return 1;
+    }
+    return ctl_cmd(cmd);
 }
 
 static int cmd_config(int argc, char **argv)
@@ -837,6 +910,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "pause") == 0) {
         return cmd_pause(argc, argv);
+    }
+    if (strcmp(cmd, "sim") == 0) {
+        return cmd_sim(argc, argv);
     }
     if (strcmp(cmd, "resume") == 0 || strcmp(cmd, "clear") == 0) {
         return ctl_cmd_ack(cmd);
