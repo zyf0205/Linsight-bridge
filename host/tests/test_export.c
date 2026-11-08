@@ -1,0 +1,103 @@
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "canlog.h"
+
+static void make_record(linsight_can_record_t *r, uint16_t seq, uint32_t ts, uint32_t id,
+                        uint8_t flags, uint8_t dlc)
+{
+    memset(r, 0, sizeof(*r));
+    r->seq = seq;
+    r->ts_ms = ts;
+    r->id = id;
+    r->flags = flags;
+    r->dlc = dlc;
+    for (uint8_t i = 0; i < dlc; i++) {
+        r->data[i] = (uint8_t)(0x11u * (i + 1));
+    }
+}
+
+static char *read_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    assert(f);
+    fseek(f, 0, SEEK_END);
+    const long sz = ftell(f);
+    rewind(f);
+    char *buf = malloc((size_t)sz + 1);
+    assert(buf);
+    assert(fread(buf, 1, (size_t)sz, f) == (size_t)sz);
+    fclose(f);
+    buf[sz] = '\0';
+    return buf;
+}
+
+int main(void)
+{
+    char path[] = "/tmp/linsight-export-XXXXXX";
+    const int fd = mkstemp(path);
+    assert(fd >= 0);
+    close(fd);
+
+    lsc_writer_t w;
+    const lsc_open_info_t info = {
+        .start_wall_ms = 1700000000000ull,
+        .flags = LSC_FLAG_ANCHOR_MS_VALID | LSC_FLAG_BOOT_VALID,
+        .boot_count = 7,
+    };
+    assert(lsc_writer_open_ex(&w, path, 500000, &info) == 0);
+
+    linsight_can_record_t r;
+    make_record(&r, 1, 1500, 0x123, 0, 2);
+    assert(lsc_writer_write(&w, &r) == 0);
+    make_record(&r, 2, 1600, 0x18DAF110u, LINSIGHT_REC_FLAG_EXT, 2);
+    assert(lsc_writer_write(&w, &r) == 0);
+    make_record(&r, 3, 1700, 0x321, LINSIGHT_REC_FLAG_RTR, 3);
+    assert(lsc_writer_write(&w, &r) == 0);
+    lsc_writer_close(&w);
+
+    /* Reader exposes the extended header. */
+    lsc_reader_t rd;
+    assert(lsc_reader_open(&rd, path) == 0);
+    assert(rd.start_wall_ms == 1700000000000ull);
+    assert(rd.boot_count == 7);
+    assert(rd.flags & LSC_FLAG_ANCHOR_MS_VALID);
+    lsc_reader_close(&rd);
+
+    char dump[] = "/tmp/linsight-export-dump-XXXXXX";
+    const int dfd = mkstemp(dump);
+    assert(dfd >= 0);
+    close(dfd);
+    assert(canlog_export_candump(path, dump) == 3);
+    char *text = read_file(dump);
+    assert(strstr(text, "(1700000001.500000) can0 123#1122\n") != NULL);
+    assert(strstr(text, "(1700000001.600000) can0 18DAF110#1122\n") != NULL);
+    assert(strstr(text, "(1700000001.700000) can0 321#R\n") != NULL);
+    free(text);
+
+    char asc[] = "/tmp/linsight-export-asc-XXXXXX";
+    const int afd = mkstemp(asc);
+    assert(afd >= 0);
+    close(afd);
+    assert(canlog_export_asc(path, asc) == 3);
+    text = read_file(asc);
+    assert(strstr(text, "base hex  timestamps absolute\n") != NULL);
+    assert(strstr(text, "Begin Triggerblock ") != NULL);
+    assert(strstr(text, "  1.500000 1  123            Rx   d 2 11 22\n") != NULL);
+    assert(strstr(text, "  1.600000 1  18DAF110x") != NULL);
+    assert(strstr(text, "  1.700000 1  321            Rx   r 3\n") != NULL);
+    assert(strstr(text, "End Triggerblock\n") != NULL);
+    free(text);
+
+    /* Refuse to overwrite the input file. */
+    assert(canlog_export_candump(path, path) == -1);
+
+    unlink(path);
+    unlink(dump);
+    unlink(asc);
+    puts("export: ok");
+    return 0;
+}

@@ -45,14 +45,14 @@
   `DATA` 最多 23 字符；`CNT` 为按 ID 计数（128 槽），超 10000 缩写为 `14.2k`。
   锁定行左侧有 3 px 蓝色竖条；无匹配帧时覆盖提示 `Waiting for CAN frames /
   check wiring / bitrate`。
-- 底栏：`FPS`、`LOAD`（≥75% 橙色）、`ERR TEC/REC`（≥128 红）、`OVF`（>0 红）。
+- 底栏：`FPS`、`LOAD`（≥75% 橙色）、`ERR TEC/REC`（≥128 红）；第四格无溢出时显示 `REC nF` / `SD READY` / `SD ERROR` / `NO SD`，溢出时显示红色 `OVF`。
 - 操作反馈：比特率/模式切换、Clear、Recover、锁定 ID 在底栏上方弹出 1.4 s toast。
 
 ## 4. Settings 布局
 
 ```text
 +----------------------------------------------------------------+
-| < Monitor                                      LS-CAN v2.0.0    | 28
+| < Monitor                                      REMOTE SYNC      | 28
 +----------------------------------------------------------------+
 | [125K] [250K] [500K] [1M]                         [Normal]      | 52
 +----------------------------------------------------------------+
@@ -71,6 +71,7 @@
   若在 Settings 页会自动跳回 Monitor。再按 Pause/GPIO0 只解除画面冻结。
 - 动作：`Clear` 清设备统计与本地视图；`Recover` 调 `twai_capture_recover()`；
   `Pause/Resume` 语义见 §5。
+- 顶栏右侧状态：`REMOTE SYNC`（主机 CONTROL 后 1.5 s）/ `REC nF` / `SD READY` / `SD ERROR` / `NO SD`。
 
 ## 5. 输入与主机联动
 
@@ -80,12 +81,12 @@
 | GPIO0 长按 | Monitor ↔ Settings |
 | 左右滑 / 齿轮 / 返回 | 切页 |
 | 点击 trace 行 | 锁定/取消该 ID，并同步过滤与触发目标 |
-| 主机 CONTROL | `pause/resume/clear/set_config` 生效后回 ACK；UI 显示 `REMOTE SYNC` 1.5 s |
+| 主机 CONTROL | `pause`（可带 lease）/`resume`/`clear`/`mark`/`set_config` 生效后回 ACK；UI 显示 `REMOTE SYNC` 1.5 s |
 
 - `sync_control()` 预留 `filter_id` 参数；当前 `net.c` 对所有 CONTROL 传 `0xFFFFFFFF`，
   不改变过滤，只刷新 REMOTE SYNC 与统计。
 
-- 主机 pause 是真正的采集暂停（`twai_capture_set_paused`），恢复时由同一按钮解除；
+- 主机 pause 是真正的采集暂停（`twai_capture_set_paused`，租约 5 s–30 min，超时或主机断开自动恢复）；
   本地 Pause 只冻结画面（`s_frozen`），采集与网络流式继续。
 - `twai_capture_set_paused` / `linsight_ui_set_conn` / `sync_control` 只写无锁邮箱；
   20 Hz tick 在 LVGL 任务内消费。GPIO 按键处理会取 `lvgl_port_lock`，不得从 net_task 调用。

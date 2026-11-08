@@ -9,24 +9,44 @@
 /*
  * .lsc binary log: 32-byte header + raw 20-byte records.
  * Header: magic "LSC1" | u16 version | u32 bitrate | u32 flags |
- *         u64 unix-seconds at session start | reserved to 32 bytes.
+ *         u16 reserved | u64 unix-seconds at uptime 0 | u32 boot_count |
+ *         u32 anchor_ms (millisecond remainder).
+ * The reserved bytes keep old readers working (they only use start_wall).
  * A truncated tail record is tolerated when reading (crash recovery).
  */
 
 #define LSC_HEADER_SIZE 32u
 #define LSC_VERSION 1u
 
+/* Header flags. Old readers ignore them. */
+#define LSC_FLAG_TS_UPTIME_ONLY 0x1u /* start_wall is not a wall clock */
+#define LSC_FLAG_ANCHOR_MS_VALID 0x2u /* anchor_ms is meaningful */
+#define LSC_FLAG_BOOT_VALID 0x4u      /* boot_count is meaningful */
+
+typedef struct {
+    uint64_t start_wall_ms; /* wall time corresponding to device uptime 0 */
+    uint32_t flags;         /* LSC_FLAG_* */
+    uint32_t boot_count;
+} lsc_open_info_t;
+
 typedef struct {
     FILE *f;
     uint64_t written;
     uint32_t bitrate;
-    uint64_t start_wall; /* unix seconds at session start */
+    uint32_t flags;
+    uint32_t boot_count;
+    uint64_t start_wall;    /* unix seconds at uptime 0 (compat) */
+    uint64_t start_wall_ms; /* full millisecond anchor */
 } lsc_writer_t;
 
 int lsc_writer_open(lsc_writer_t *w, const char *path, uint32_t bitrate, uint64_t start_wall);
+int lsc_writer_open_ex(lsc_writer_t *w, const char *path, uint32_t bitrate,
+                       const lsc_open_info_t *info);
 /* Returns 0 on success, -1 on write error. */
 int lsc_writer_write(lsc_writer_t *w, const linsight_can_record_t *r);
 int lsc_writer_flush(lsc_writer_t *w);
+/* fflush + fdatasync; call at most once per second on slow storage. */
+int lsc_writer_sync(lsc_writer_t *w);
 void lsc_writer_close(lsc_writer_t *w);
 
 /* Returns the number of records passed to cb, or -1 on open error. */
@@ -39,7 +59,12 @@ long lsc_read(const char *path, lsc_record_cb cb, void *ctx);
 typedef struct {
     FILE *f;
     uint32_t bitrate;
-    uint64_t start_wall;
+    uint32_t flags;
+    uint32_t boot_count;
+    uint32_t anchor_ms;
+    uint64_t start_wall;    /* compat seconds */
+    uint64_t start_wall_ms; /* start_wall*1000 + anchor_ms */
+    bool wall_valid;
     uint64_t remaining; /* snapshot of records present at open */
 } lsc_reader_t;
 
@@ -71,3 +96,5 @@ long canlog_export_candump_filtered(const char *lsc_path, const char *out_path,
  * Returns the string length, or -1 when buf is too small. */
 int canlog_format_candump(const linsight_can_record_t *r, uint64_t start_wall, char *buf,
                           size_t cap);
+int canlog_format_candump_ms(const linsight_can_record_t *r, uint64_t start_wall_ms, char *buf,
+                             size_t cap);

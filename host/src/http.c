@@ -12,7 +12,7 @@
 #include <unistd.h>
 
 #define HTTP_IN_CAP 2048
-#define HTTP_OUT_CAP 32768
+#define HTTP_OUT_CAP 65536
 #define HTTP_SSE_CHUNK 64u
 #define HTTP_EVENT_CAP 8192u
 #define HTTP_PAGE_MAX (256u * 1024u)
@@ -122,7 +122,22 @@ static void http_reply(http_server_t *s, http_conn_t *c, int code, const char *r
                            code, reason, ctype, body_len);
     if (n <= 0 || (size_t)n >= sizeof(hdr) ||
         c->out_len + (size_t)n + body_len > sizeof(c->out)) {
-        conn_close(s, c);
+        /* Nothing queued yet: still explain the failure instead of a bare
+         * RST. If a partial response is already queued, closing is the only
+         * safe option (a second status line would corrupt it). */
+        static const char fallback[] =
+            "HTTP/1.1 500 Internal Server Error\r\n"
+            "Content-Type: text/plain\r\nContent-Length: 17\r\n"
+            "Connection: close\r\n\r\nresponse too big\n";
+        if (c->out_len == 0 && sizeof(fallback) - 1 <= sizeof(c->out)) {
+            memcpy(c->out, fallback, sizeof(fallback) - 1);
+            c->out_len = sizeof(fallback) - 1;
+            c->close_after = true;
+            conn_set_events(s, c, true);
+            conn_flush(s, c);
+        } else {
+            conn_close(s, c);
+        }
         return;
     }
 
@@ -252,7 +267,7 @@ static void process_request(http_server_t *s, http_conn_t *c, char *req)
                        s->page_len);
         }
     } else if (strcmp(target, "/api/stats") == 0) {
-        char buf[2048];
+        char buf[8192];
         const size_t n = s->stats_cb ? s->stats_cb(s->ctx, buf, sizeof(buf)) : 0;
         if (n == 0) {
             http_error(s, c, 503, "Service Unavailable", "stats unavailable\n");
@@ -513,6 +528,13 @@ http_server_t *http_server_new(int epoll_fd, const char *bind_addr, uint16_t por
         s->conns[i].fd = -1;
     }
     s->page = load_page(web_dir, &s->page_len);
+    if (s->page && s->page_len + 512u > HTTP_OUT_CAP) {
+        fprintf(stderr, "http: page is %zu bytes, too large for the %u-byte response cap\n",
+                s->page_len, (unsigned)HTTP_OUT_CAP);
+        free(s->page);
+        s->page = NULL;
+        s->page_len = 0;
+    }
 
     const int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {

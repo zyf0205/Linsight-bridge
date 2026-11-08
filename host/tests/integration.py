@@ -120,7 +120,8 @@ def _run_test(port, ctl_port, http_port, ctl, cli, log_dir, proc):
     if not live_data.endswith(b"\n"):
         fail(f"live stream not newline-terminated: {live_data[-40:]!r}")
     live_text = live_data.decode(errors="replace")
-    if "can0" not in live_text or "01ABCDEF" not in live_text or "00000123" not in live_text:
+    if ("can0 " not in live_text or "1ABCDEF#" not in live_text or
+            "00000123#" not in live_text):
         fail(f"live stream content: {live_text!r}")
 
     # Dashboard page + JSON stats (same epoll loop as device and CLI).
@@ -214,12 +215,19 @@ def _run_test(port, ctl_port, http_port, ctl, cli, log_dir, proc):
         lines = f.read().splitlines()
     if len(lines) != 10:
         fail(f"export lines: {len(lines)}")
-    # Timestamp = start_wall + ts_ms/1000, so record 0 (ts 1000 ms) ends .000000.
-    if "can0" not in lines[0] or ".000000)" not in lines[0]:
+    # Timestamp = start_wall + ts_ms/1000; the anchor is millisecond-accurate
+    # now, so only check that it is a plausible wall clock.
+    if "can0" not in lines[0] or not lines[0].startswith("("):
         fail(f"export line 0 malformed: {lines[0]!r}")
-    if "01ABCDEF" not in lines[0]:  # even index -> extended id, no pad
+    try:
+        ts0 = float(lines[0][1:lines[0].index(")")])
+    except ValueError:
+        fail(f"export line 0 timestamp: {lines[0]!r}")
+    if abs(ts0 - time.time()) > 10:
+        fail(f"export line 0 timestamp not anchored: {lines[0]!r}")
+    if "1ABCDEF#" not in lines[0]:  # even index -> standard id, 3-digit minimum
         fail(f"export line 0 missing id: {lines[0]!r}")
-    if "00000123" not in lines[1]:  # odd index -> standard id, 8-digit pad
+    if "00000123#" not in lines[1]:  # odd index -> extended id, 8-digit pad
         fail(f"export line 1 missing id: {lines[1]!r}")
 
     # Device disconnect closes the log gracefully.

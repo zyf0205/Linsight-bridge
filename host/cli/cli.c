@@ -24,7 +24,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -32,12 +34,17 @@
 #include "canlog.h"
 #include "compare.h"
 #include "dbc.h"
+#include "import.h"
 #include "replay.h"
 
 #define DEFAULT_CTL "/tmp/linsight.sock"
+#define SYSTEM_CTL "/run/linsight/ctl.sock"
+#define CLI_VERSION "0.3.0"
 #define REPLY_MAX 4096
 
-static const char *g_ctl = DEFAULT_CTL;
+static const char *g_ctl;
+static int g_ctl_port;
+static bool g_version;
 static volatile sig_atomic_t g_stop;
 
 static void usage(void)
@@ -46,27 +53,49 @@ static void usage(void)
             "usage: linsight-cli stats [--watch] [--interval MS]\n"
             "       linsight-cli live [--id ID] [--ext|--std] [--color]\n"
             "       linsight-cli config [--bitrate N] [--mode listen|normal|selftest]\n"
-            "       linsight-cli pause|resume|clear\n"
+            "       linsight-cli pause [--lease MS] | resume | clear\n"
             "       linsight-cli export asc|candump FILE.lsc [-o OUT]\n"
             "                         [--id ID] [--ext|--std] [--from EPOCH] [--to EPOCH]\n"
             "       linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]\n"
             "       linsight-cli compare REF.lsc CAND.lsc\n"
             "       linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]\n"
-            "       global: --ctl PATH (default " DEFAULT_CTL ")\n");
+            "       linsight-cli import FILE.lsc -o OUT.lsc [--boot-wall EPOCH]\n"
+            "       linsight-cli verify FILE.lsc [--strict]\n"
+            "       global: --ctl PATH | --ctl-port PORT | --version\n"
+            "       (default " SYSTEM_CTL ", " DEFAULT_CTL ", or $LINSIGHT_CTL)\n");
 }
 
 static int ctl_connect(void)
 {
-    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return -1;
+    int fd;
+    if (g_ctl_port > 0) {
+        fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (fd < 0) {
+            return -1;
+        }
+        struct sockaddr_in addr = {.sin_family = AF_INET};
+        addr.sin_port = htons((uint16_t)g_ctl_port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            close(fd);
+            return -1;
+        }
+    } else {
+        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            return -1;
+        }
+        struct sockaddr_un addr = {.sun_family = AF_UNIX};
+        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", g_ctl);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            close(fd);
+            return -1;
+        }
     }
-    struct sockaddr_un addr = {.sun_family = AF_UNIX};
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", g_ctl);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return -1;
-    }
+
+    /* A daemon with no device must not leave a control command blocked. */
+    struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return fd;
 }
 
@@ -74,8 +103,13 @@ static int connect_or_report(void)
 {
     const int fd = ctl_connect();
     if (fd < 0) {
-        fprintf(stderr, "linsight-cli: cannot connect to %s: %s\n", g_ctl,
-                strerror(errno));
+        if (g_ctl_port > 0) {
+            fprintf(stderr, "linsight-cli: cannot connect to 127.0.0.1:%d: %s\n",
+                    g_ctl_port, strerror(errno));
+        } else {
+            fprintf(stderr, "linsight-cli: cannot connect to %s: %s\n", g_ctl,
+                    strerror(errno));
+        }
         fprintf(stderr, "(is linsightd running?)\n");
     }
     return fd;
@@ -105,6 +139,7 @@ static int ctl_cmd(const char *cmd)
     }
 
     char buf[REPLY_MAX];
+    int rc = 0;
     for (;;) {
         const ssize_t got = read(fd, buf, sizeof(buf));
         if (got > 0) {
@@ -116,11 +151,12 @@ static int ctl_cmd(const char *cmd)
         }
         if (got < 0) {
             fprintf(stderr, "linsight-cli: read failed: %s\n", strerror(errno));
+            rc = 1;
         }
         break;
     }
     close(fd);
-    return 0;
+    return rc;
 }
 
 /* CONTROL command: print OK / BAD_ARG / FAILED from the device ACK. */
@@ -161,7 +197,8 @@ static int ctl_cmd_ack(const char *cmd)
         } else {
             fprintf(stderr, "linsight-cli: no reply from daemon\n");
         }
-        return 1;
+        /* 4 = the daemon never saw an ACK from the device (or timed out). */
+        return strstr(buf, "ack timeout") ? 4 : 1;
     }
     switch (atoi(code + strlen("\"code\":"))) {
     case 0:
@@ -595,6 +632,112 @@ static int cmd_decode(int argc, char **argv)
     return 0;
 }
 
+static int cmd_import(int argc, char **argv)
+{
+    if (argc < 3) {
+        usage();
+        return 1;
+    }
+    const char *src = argv[2];
+    const char *dst = NULL;
+    bool have_boot = false;
+    uint64_t boot_wall = 0;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+            dst = argv[++i];
+        } else if (strcmp(argv[i], "--boot-wall") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &boot_wall)) {
+                fprintf(stderr, "linsight-cli: bad --boot-wall '%s'\n", argv[i]);
+                return 1;
+            }
+            have_boot = true;
+        } else {
+            usage();
+            return 1;
+        }
+    }
+    if (!dst) {
+        fprintf(stderr, "linsight-cli: import needs -o OUT.lsc\n");
+        return 1;
+    }
+
+    lsc_import_info_t info;
+    char err[256] = {0};
+    if (lsc_import(src, dst, have_boot, boot_wall, &info, err, sizeof(err)) != 0) {
+        fprintf(stderr, "linsight-cli: import failed: %s\n", err);
+        return 1;
+    }
+    printf("import: %llu records, boot %u, bitrate %u, anchor %llu ms (%s)\n",
+           (unsigned long long)info.records, (unsigned)info.boot_count,
+           (unsigned)info.bitrate, (unsigned long long)info.start_wall_ms,
+           info.uptime_only ? "re-anchored" : "wall clock preserved");
+    if (info.uptime_only && !have_boot) {
+        fprintf(stderr, "linsight-cli: warning: anchored from file mtime; "
+                        "use --boot-wall for exact dates\n");
+    }
+    lsc_print_sidecars(src, stdout);
+    return 0;
+}
+
+static int cmd_verify(int argc, char **argv)
+{
+    if (argc < 3) {
+        usage();
+        return 1;
+    }
+    const char *path = argv[2];
+    bool strict = false;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--strict") == 0) {
+            strict = true;
+        } else {
+            usage();
+            return 1;
+        }
+    }
+
+    lsc_import_info_t info;
+    char err[256] = {0};
+    const int rc = lsc_verify(path, strict, &info, err, sizeof(err));
+    printf("verify: records=%llu boot=%u bitrate=%u flags=0x%X uptime_only=%d "
+           "gaps=%llu missing=%llu backwards=%llu dup=%llu ambiguous=%llu "
+           "truncated=%d\n",
+           (unsigned long long)info.records, (unsigned)info.boot_count,
+           (unsigned)info.bitrate, (unsigned)info.flags, info.uptime_only ? 1 : 0,
+           (unsigned long long)info.gaps, (unsigned long long)info.missing,
+           (unsigned long long)info.backwards, (unsigned long long)info.duplicates,
+           (unsigned long long)info.ambiguous, info.truncated ? 1 : 0);
+    if (rc != 0) {
+        fprintf(stderr, "linsight-cli: verify: %s\n", err);
+    }
+    return rc;
+}
+
+static int cmd_pause(int argc, char **argv)
+{
+    uint32_t lease = 0;
+    bool has_lease = false;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--lease") == 0 && i + 1 < argc) {
+            if (!parse_u32(argv[++i], 1800000u, &lease) || lease < 5000) {
+                fprintf(stderr, "linsight-cli: --lease must be 5000..1800000 ms\n");
+                return 1;
+            }
+            has_lease = true;
+        } else {
+            usage();
+            return 1;
+        }
+    }
+    char cmd[64];
+    const int n = has_lease ? snprintf(cmd, sizeof(cmd), "pause lease=%u", lease)
+                            : snprintf(cmd, sizeof(cmd), "pause");
+    if (n <= 0 || n >= (int)sizeof(cmd)) {
+        return 1;
+    }
+    return ctl_cmd_ack(cmd);
+}
+
 static int cmd_compare(int argc, char **argv)
 {
     if (argc != 4) {
@@ -615,13 +758,23 @@ static int cmd_compare(int argc, char **argv)
     return (st.missing || st.extra || st.order) ? 1 : 0;
 }
 
-/* Move --ctl out of argv so subcommands only see their own options. */
+/* Move global options out of argv so subcommands only see their own. */
 static int strip_global_args(int argc, char **argv)
 {
     int out = 1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--ctl") == 0 && i + 1 < argc) {
             g_ctl = argv[++i];
+        } else if (strcmp(argv[i], "--ctl-port") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            const long v = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || v <= 0 || v > 65535) {
+                fprintf(stderr, "linsight-cli: bad --ctl-port '%s'\n", argv[i]);
+                return -1;
+            }
+            g_ctl_port = (int)v;
+        } else if (strcmp(argv[i], "--version") == 0) {
+            g_version = true;
         } else {
             argv[out++] = argv[i];
         }
@@ -632,6 +785,23 @@ static int strip_global_args(int argc, char **argv)
 int main(int argc, char **argv)
 {
     argc = strip_global_args(argc, argv);
+    if (argc < 0) {
+        return 1;
+    }
+    if (g_version) {
+        puts("linsight-cli " CLI_VERSION);
+        return 0;
+    }
+    if (!g_ctl) {
+        const char *env = getenv("LINSIGHT_CTL");
+        if (env && *env) {
+            g_ctl = env;
+        } else if (access(SYSTEM_CTL, F_OK) == 0) {
+            g_ctl = SYSTEM_CTL;
+        } else {
+            g_ctl = DEFAULT_CTL;
+        }
+    }
     if (argc < 2) {
         usage();
         return 1;
@@ -659,8 +829,16 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "decode") == 0) {
         return cmd_decode(argc, argv);
     }
-    if (strcmp(cmd, "pause") == 0 || strcmp(cmd, "resume") == 0 ||
-        strcmp(cmd, "clear") == 0) {
+    if (strcmp(cmd, "import") == 0) {
+        return cmd_import(argc, argv);
+    }
+    if (strcmp(cmd, "verify") == 0) {
+        return cmd_verify(argc, argv);
+    }
+    if (strcmp(cmd, "pause") == 0) {
+        return cmd_pause(argc, argv);
+    }
+    if (strcmp(cmd, "resume") == 0 || strcmp(cmd, "clear") == 0) {
         return ctl_cmd_ack(cmd);
     }
 

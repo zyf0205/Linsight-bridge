@@ -186,6 +186,46 @@ static void test_reader_snapshot(void)
     CHECK(n == 4);
 }
 
+
+static void test_header_extensions(void)
+{
+    lsc_writer_t w;
+    const lsc_open_info_t info = {
+        .start_wall_ms = 1700000000123ull,
+        .flags = LSC_FLAG_ANCHOR_MS_VALID | LSC_FLAG_BOOT_VALID,
+        .boot_count = 42,
+    };
+    CHECK(lsc_writer_open_ex(&w, g_path, 500000, &info) == 0);
+    const linsight_can_record_t rec = {.seq = 0, .ts_ms = 5, .id = 0x123, .dlc = 0};
+    CHECK(lsc_writer_write(&w, &rec) == 0);
+    CHECK(lsc_writer_sync(&w) == 0);
+    lsc_writer_close(&w);
+
+    lsc_reader_t r;
+    CHECK(lsc_reader_open(&r, g_path) == 0);
+    CHECK(r.flags == (LSC_FLAG_ANCHOR_MS_VALID | LSC_FLAG_BOOT_VALID));
+    CHECK(r.boot_count == 42);
+    CHECK(r.anchor_ms == 123);
+    CHECK(r.start_wall == 1700000000u);
+    CHECK(r.start_wall_ms == 1700000000123ull);
+    CHECK(r.wall_valid);
+    lsc_reader_close(&r);
+
+    /* Device SD-style header: uptime only, re-anchored later by import. */
+    const lsc_open_info_t uptime = {
+        .start_wall_ms = 0,
+        .flags = LSC_FLAG_TS_UPTIME_ONLY | LSC_FLAG_BOOT_VALID,
+        .boot_count = 7,
+    };
+    CHECK(lsc_writer_open_ex(&w, g_path, 500000, &uptime) == 0);
+    lsc_writer_close(&w);
+    CHECK(lsc_reader_open(&r, g_path) == 0);
+    CHECK(!r.wall_valid);
+    CHECK(r.boot_count == 7);
+    CHECK(r.start_wall_ms == 0);
+    lsc_reader_close(&r);
+}
+
 int main(void)
 {
     snprintf(g_path, sizeof(g_path), "/tmp/test-canlog-XXXXXX");
@@ -207,6 +247,7 @@ int main(void)
     test_reader_and_filters();
     test_rejects_bad_header();
     test_reader_snapshot();
+    test_header_extensions();
 
     unlink(g_path);
     unlink(g_out);

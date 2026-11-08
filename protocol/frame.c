@@ -23,6 +23,8 @@ uint16_t linsight_frame_max_payload(uint8_t type)
         return LINSIGHT_MAX_ACK;
     case LINSIGHT_FRAME_FLOW:
         return LINSIGHT_MAX_FLOW;
+    case LINSIGHT_FRAME_DEVICE_INFO:
+        return LINSIGHT_MAX_DEVICE_INFO;
     default:
         return UINT16_MAX;
     }

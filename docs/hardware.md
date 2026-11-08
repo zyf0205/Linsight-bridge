@@ -1,6 +1,6 @@
 # LinSight 硬件
 
-> 立创·实战派 ESP32-S3（无电池 / 无摄像头）；来源：官方 wiki + `08-lcd_lvgl` BSP。更新：2026-11-05。
+> 立创·实战派 ESP32-S3（无电池 / 无摄像头）；来源：官方 wiki + `08-lcd_lvgl` BSP。更新：2026-11-08。
 
 ## 1. 板卡
 
@@ -28,6 +28,7 @@
 | 43 / 44 | UART0 TX / RX | CH340K |
 
 - 除扩展口外没有引出其他 GPIO（GPIO12、22–25 需焊测试点）；所有 IO 为 **3.3V，不耐 5V**。
+- TF 卡：板载 1-bit SDMMC（CLK/CMD/D0 = 47/48/21），无卡检测脚；FAT32、8.3 名 `recNNNNN.lsc`，每 5 s 重试挂载。
 
 ## 3. 显示与触摸
 
@@ -84,8 +85,7 @@ USB-CAN            CAN_H ── 收发器 CANH
 收发器 TXD ── GPIO10 (J2 引脚2)  收发器 RXD ── GPIO11 (J2 引脚1)
 ```
 
-- 3.3V 收发器（SN65HVD230 类）；总线两端 120Ω 终端电阻；PCAN 与板共地（USB 已共地）。仅 CAN 2.0A/B（S3 不支持 FD），默认 500k。
-- 固件 `TWAI_MODE_LISTEN_ONLY` 为默认（不 ACK，安全）；台架单对节点测试需切 `NORMAL`，否则发送方收不到 ACK 会重发。
+- 3.3V 收发器（SN65HVD230 类）；两端 120Ω 终端、共地。仅 CAN 2.0A/B，默认 500k；固件默认 `LISTEN_ONLY`（不 ACK），台架单对节点需切 `NORMAL`，否则发送方收不到 ACK 会重发。
 
 | 比特率 | 8B 标准帧理论上限 | 80% 负载 | 台架建议 |
 |---|---:|---:|---:|
@@ -108,13 +108,13 @@ USB-CAN            CAN_H ── 收发器 CANH
 | TCP 窗口 / 发送缓冲 / RECVMBOX | 32768 / 32768 / 32 |
 | `CONFIG_ESPTOOLPY_FLASHMODE_DIO` | QIO（先验证启动） |
 | `CONFIG_LV_COLOR_16_SWAP` | y |
+| FATFS | `LFN_NONE=y`、`ALLOC_PREFER_EXTRAM=y`（SD 黑盒，8.3 文件名） |
 | 分区表 | 加 64KB `coredump` 分区 |
 
 注意：`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384` 会让 >16KB 的 `malloc` 落 PSRAM；draw buffer 必须 `heap_caps_malloc(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)`。
 
 ## 7. 上电自检
 
-- [ ] `esp_psram_get_size()` = 8MB
-- [ ] I2C 扫描到 0x19 / 0x38 / 0x6A
+- [ ] `esp_psram_get_size()` = 8MB；I2C 扫描到 0x19 / 0x38 / 0x6A
 - [ ] 纯色全屏正常（红/绿）
 - [ ] 背光 0% / 100% 可控，触摸四角坐标准确

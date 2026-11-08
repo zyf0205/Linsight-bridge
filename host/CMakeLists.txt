@@ -20,6 +20,7 @@ add_executable(linsightd
     src/main.c
     src/canlog.c
     src/http.c
+    src/session.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
 target_link_libraries(linsightd pthread rt)
 
@@ -30,6 +31,8 @@ add_executable(linsight-cli
     src/compare.c
     src/dbc.c
     src/replay.c
+    src/session.c
+    src/import.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
 target_include_directories(linsight-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(linsight-cli rt)
@@ -53,6 +56,15 @@ add_executable(test_compare tests/test_compare.c src/canlog.c src/compare.c
 target_include_directories(test_compare PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_executable(test_dbc tests/test_dbc.c src/dbc.c)
 target_include_directories(test_dbc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_executable(test_session tests/test_session.c src/session.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
+target_include_directories(test_session PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_executable(test_export tests/test_export.c src/canlog.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
+target_include_directories(test_export PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_executable(test_import tests/test_import.c src/import.c src/session.c src/canlog.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
+target_include_directories(test_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_test(NAME record COMMAND test_record)
 add_test(NAME parser COMMAND test_parser)
 add_test(NAME fuzz COMMAND test_fuzz)
@@ -60,6 +72,9 @@ add_test(NAME ring COMMAND test_ring)
 add_test(NAME canlog COMMAND test_canlog)
 add_test(NAME compare COMMAND test_compare)
 add_test(NAME dbc COMMAND test_dbc)
+add_test(NAME session COMMAND test_session)
+add_test(NAME export COMMAND test_export)
+add_test(NAME import COMMAND test_import)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)

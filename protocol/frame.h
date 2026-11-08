@@ -11,10 +11,11 @@
  * Frame: AA 55 | type | len_lo | len_hi | payload[len]
  * All multi-byte integers are little-endian.
  *
- * Device -> host: HELLO, CAN_BATCH, STATS, EVENT, PING, ACK
+ * Device -> host: HELLO, CAN_BATCH, STATS, EVENT, PING, ACK, DEVICE_INFO
  * Host -> device: CONTROL, FLOW, PING, PONG
  * CAN_BATCH payload: u16 count + count * 20-byte records (see below).
- * STATS / EVENT / HELLO / CONTROL / ACK payloads are small JSON objects.
+ * STATS / EVENT / HELLO / CONTROL / ACK / DEVICE_INFO payloads are small JSON
+ * objects. DEVICE_INFO is additive (type 10); older hosts skip unknown types.
  */
 
 #include <stdbool.h>
@@ -29,7 +30,7 @@ extern "C" {
 #define LINSIGHT_FRAME_MAGIC1 0x55u
 #define LINSIGHT_FRAME_HEADER_SIZE 5u
 
-#define LINSIGHT_PROTO_VERSION 0x20u
+#define LINSIGHT_PROTO_VERSION 0x21u
 
 #define LINSIGHT_MAX_HELLO 256u
 #define LINSIGHT_MAX_CAN_BATCH 16384u
@@ -40,6 +41,18 @@ extern "C" {
 #define LINSIGHT_MAX_CONTROL 128u
 #define LINSIGHT_MAX_ACK 32u /* {"id":N,"code":N} needs 17+ bytes */
 #define LINSIGHT_MAX_FLOW 1u
+#define LINSIGHT_MAX_DEVICE_INFO 512u
+
+/* DEVICE_INFO "caps" bitmask. */
+#define LINSIGHT_CAP_SD 0x01u
+#define LINSIGHT_CAP_MARK 0x02u
+#define LINSIGHT_CAP_PAUSE_LEASE 0x04u
+
+/* Host-initiated capture pause lease. A dead host must not stop capture
+ * forever; the device resumes after the lease (or on disconnect). */
+#define LINSIGHT_PAUSE_LEASE_DEFAULT_MS 300000u
+#define LINSIGHT_PAUSE_LEASE_MIN_MS 5000u
+#define LINSIGHT_PAUSE_LEASE_MAX_MS 1800000u
 
 /* One 20-byte record, wire order:
  * seq u16 | ts_ms u32 | id u32 | flags u8 | dlc u8 | data[8]
@@ -66,13 +79,15 @@ typedef enum {
     LINSIGHT_FRAME_CONTROL = 7,
     LINSIGHT_FRAME_ACK = 8,
     LINSIGHT_FRAME_FLOW = 9,
+    LINSIGHT_FRAME_DEVICE_INFO = 10,
 } linsight_frame_type_t;
 
 /* CONTROL actions (JSON "action" field). */
-#define LINSIGHT_CTRL_PAUSE "pause"
+#define LINSIGHT_CTRL_PAUSE "pause"   /* + optional lease_ms */
 #define LINSIGHT_CTRL_RESUME "resume"
 #define LINSIGHT_CTRL_CLEAR "clear_stats"
 #define LINSIGHT_CTRL_CONFIG "set_config" /* + optional bitrate / mode */
+#define LINSIGHT_CTRL_MARK "mark"         /* + optional id / seq: SD trigger mark */
 
 typedef enum {
     LINSIGHT_ACK_OK = 0,

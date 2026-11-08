@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3.0 — 2026-11-08
+
+- Protocol v2.1 (additive): `DEVICE_INFO` type 10, HELLO `device_id`/`boot`/
+  `uptime_ms`, `pause` lease and `mark`; `.lsc` header keeps boot count and a
+  millisecond anchor in its reserved bytes.
+- Host timestamp trust: HELLO uptime anchors device time once per boot; a
+  reconnect backlog is deduped by `ts_ms`/`seq` and gaps are counted instead of
+  shifting history. 512-byte STATS frames are no longer dropped.
+- Nonblocking daemon: device and CLI replies use per-connection output queues
+  with EPOLLOUT; no `send_all`/`poll` in epoll callbacks, ACK timeout 3 s,
+  64-event epoll batches.
+- `.lsc` recovery/retention: re-open after a transient write error, 1 Hz
+  `fdatasync`, `--log-max-total-mb` oldest-first deletion, 64 KiB HTTP response.
+- CLI: socket auto-detection, `--ctl-port`, `--version`, `pause --lease`,
+  `import` (mtime/`--boot-wall` re-anchoring) and `verify` (`--strict`).
+- Exports now match can-utils candump (`123#1122`, `18DAF110#...`, `#R`) and
+  Vector ASC headers/records; exporting onto the input path is rejected.
+- Tests: 12 (session, export, import added); integration covers dedupe and
+  nonblocking control.
+
 ## v0.2.0 — 2026-11-07
 
 - HTTP + SSE dashboard served by `linsightd` on the same epoll loop

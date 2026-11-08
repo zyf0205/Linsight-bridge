@@ -14,6 +14,7 @@
  *   pause / resume / clear -> forwarded to the device as CONTROL, ACK echoed
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -40,20 +41,26 @@
 #include "canlog.h"
 #include "frame.h"
 #include "http.h"
+#include "session.h"
 
 #define TAG "linsightd"
 
-#define WRING_CAP 16384u /* records; ~320 KB */
+#define WRING_CAP 131072u /* records; ~3 MB: absorbs a 4 MiB device backlog */
 #define CLI_MAX 8
 #define RX_BUF_SIZE 4096
 #define IDLE_TIMEOUT_MS 30000u
 #define LOG_BATCH 512u /* records per writer iteration */
+#define DEV_OUT_CAP 4096u
+#define CLI_OUT_CAP 4096u
+#define MAX_EVENTS 64
+#define ACK_TIMEOUT_MS 3000u
 
 static const char *g_port = "8888";
 static const char *g_ctl_path = "/tmp/linsight.sock";
 static const char *g_ctl_port = NULL; /* optional loopback TCP control port */
 static const char *g_log_dir = ".";
 static uint64_t g_log_max_bytes; /* 0 = one file per session */
+static uint64_t g_log_max_total_bytes; /* 0 = keep every log */
 static char g_current_log[512];
 static int g_http_port = 8080;    /* 0 disables the dashboard */
 static const char *g_http_bind = "127.0.0.1";
@@ -87,11 +94,13 @@ typedef struct {
     bool close_req;
     uint32_t close_gen;
 
-    /* Wall-clock origin for the session (device ts_ms is uptime), captured
-     * when its first record arrives rather than when the writer drains it:
-     * a backlogged writer must not shift recorded timestamps. */
-    uint64_t anchor_wall;
+    /* Wall time corresponding to device uptime 0, captured from HELLO
+     * rather than the first backlog record, so a reconnect does not shift
+     * recorded history. */
+    uint64_t anchor_wall_ms;
+    uint32_t anchor_boot;
     uint32_t anchor_gen;
+    char log_error[128];
 
     bool done;
     pthread_mutex_t lock;
@@ -124,13 +133,16 @@ static void wring_push(const linsight_can_record_t *recs, uint32_t n)
 
 /* Consume the pending open request only if it still belongs to `gen`: a newer
  * reconnect may have replaced it while the writer was busy. */
-static bool wring_take_open(uint32_t gen, char *path, size_t cap, uint64_t *anchor)
+static bool wring_take_open(uint32_t gen, char *path, size_t cap, uint64_t *start_wall_ms,
+                            uint32_t *boot_count)
 {
     bool taken = false;
     pthread_mutex_lock(&g_ring.lock);
     if (g_ring.open_req && g_ring.open_gen == gen) {
         snprintf(path, cap, "%s", g_ring.open_path);
-        *anchor = g_ring.anchor_gen == gen ? g_ring.anchor_wall : 0;
+        const bool anchored = g_ring.anchor_gen == gen;
+        *start_wall_ms = anchored ? g_ring.anchor_wall_ms : 0;
+        *boot_count = anchored ? g_ring.anchor_boot : 0;
         g_ring.open_req = false;
         taken = true;
     }
@@ -138,11 +150,19 @@ static bool wring_take_open(uint32_t gen, char *path, size_t cap, uint64_t *anch
     return taken;
 }
 
-static void wring_set_anchor(uint64_t wall)
+static void wring_set_anchor_info(uint64_t start_wall_ms, uint32_t boot_count)
 {
     pthread_mutex_lock(&g_ring.lock);
-    g_ring.anchor_wall = wall;
+    g_ring.anchor_wall_ms = start_wall_ms;
+    g_ring.anchor_boot = boot_count;
     g_ring.anchor_gen = g_ring.gen;
+    pthread_mutex_unlock(&g_ring.lock);
+}
+
+static void wring_set_log_error(const char *msg)
+{
+    pthread_mutex_lock(&g_ring.lock);
+    snprintf(g_ring.log_error, sizeof(g_ring.log_error), "%s", msg ? msg : "");
     pthread_mutex_unlock(&g_ring.lock);
 }
 
@@ -223,6 +243,64 @@ static void log_part_path(const char *base, uint32_t part, char *out, size_t cap
     }
 }
 
+static uint64_t mono_ms(void);
+
+static int log_filter(const struct dirent *e)
+{
+    const size_t n = strlen(e->d_name);
+    return n > 8 && strncmp(e->d_name, "can-", 4) == 0 &&
+           strcmp(e->d_name + n - 4, ".lsc") == 0;
+}
+
+/* Delete the oldest can-*.lsc files until the directory is under the cap.
+ * Names sort by their timestamp prefix, so alphasort is oldest-first. */
+static void log_retention(void)
+{
+    if (g_log_max_total_bytes == 0) {
+        return;
+    }
+    struct dirent **list = NULL;
+    const int n = scandir(g_log_dir, &list, log_filter, alphasort);
+    if (n <= 0) {
+        return;
+    }
+
+    uint64_t total = 0;
+    for (int i = 0; i < n; i++) {
+        char path[600];
+        struct stat st;
+        snprintf(path, sizeof(path), "%s/%s", g_log_dir, list[i]->d_name);
+        if (stat(path, &st) == 0 && st.st_size > 0) {
+            total += (uint64_t)st.st_size;
+        }
+    }
+
+    pthread_mutex_lock(&g_ring.lock);
+    char current[512];
+    snprintf(current, sizeof(current), "%s", g_current_log);
+    pthread_mutex_unlock(&g_ring.lock);
+
+    for (int i = 0; i < n && total > g_log_max_total_bytes; i++) {
+        char path[600];
+        struct stat st;
+        snprintf(path, sizeof(path), "%s/%s", g_log_dir, list[i]->d_name);
+        if (strcmp(path, current) == 0) {
+            continue; /* never delete the file being written */
+        }
+        if (stat(path, &st) != 0) {
+            continue;
+        }
+        if (unlink(path) == 0) {
+            const uint64_t sz = st.st_size > 0 ? (uint64_t)st.st_size : 0;
+            total = sz > total ? 0 : total - sz;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        free(list[i]);
+    }
+    free(list);
+}
+
 static void *writer_thread(void *arg)
 {
     (void)arg;
@@ -230,8 +308,13 @@ static void *writer_thread(void *arg)
     bool log_open = false;
     uint32_t log_gen = 0;
     char base_path[512] = {0};
-    uint64_t log_start_wall = 0;
+    uint64_t log_start_wall_ms = 0;
+    uint32_t log_boot = 0;
     uint32_t log_part = 0;
+    char reopen_path[560] = {0};
+    uint64_t reopen_after_ms = 0;
+
+    log_retention();
 
     for (;;) {
         pthread_mutex_lock(&g_ring.lock);
@@ -258,6 +341,25 @@ static void *writer_thread(void *arg)
         for (uint32_t i = 0; i < n; i++) {
             const wring_entry_t *e = &batch[i];
 
+            /* A transient write error closed the file: retry a fresh part
+             * every 2 s instead of dropping the rest of the session. */
+            if (!log_open && reopen_path[0] && e->gen == log_gen &&
+                (reopen_after_ms == 0 || mono_ms() >= reopen_after_ms)) {
+                const lsc_open_info_t info = {
+                    .start_wall_ms = log_start_wall_ms,
+                    .flags = LSC_FLAG_ANCHOR_MS_VALID | LSC_FLAG_BOOT_VALID,
+                    .boot_count = log_boot,
+                };
+                log_open = lsc_writer_open_ex(&w, reopen_path, wring_bitrate(), &info) == 0;
+                if (log_open) {
+                    wring_set_current_log(reopen_path);
+                    wring_set_log_error("");
+                    reopen_path[0] = '\0';
+                } else {
+                    reopen_after_ms = mono_ms() + 2000u;
+                }
+            }
+
             if (log_open && e->gen != log_gen) {
                 /* Generation boundary: every record of the old session has
                  * been written, so it is safe to close its file now. */
@@ -267,24 +369,37 @@ static void *writer_thread(void *arg)
             }
             if (!log_open) {
                 char path[512];
-                uint64_t start_wall = 0;
-                if (wring_take_open(e->gen, path, sizeof(path), &start_wall)) {
-                    if (!start_wall) {
-                        /* No anchor recorded (should not happen): fall back to
-                         * mapping this record's uptime onto the current time. */
-                        const uint64_t now_s = (uint64_t)time(NULL);
-                        const uint64_t ts_s = e->rec.ts_ms / 1000u;
-                        start_wall = now_s > ts_s ? now_s - ts_s : now_s;
+                uint64_t start_wall_ms = 0;
+                uint32_t boot_count = 0;
+                if (wring_take_open(e->gen, path, sizeof(path), &start_wall_ms, &boot_count)) {
+                    if (!start_wall_ms) {
+                        /* No HELLO uptime (old firmware): map this record's
+                         * uptime onto the current wall clock. */
+                        struct timespec ts;
+                        clock_gettime(CLOCK_REALTIME, &ts);
+                        const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u +
+                                                (uint64_t)ts.tv_nsec / 1000000u;
+                        start_wall_ms = now_ms > e->rec.ts_ms ? now_ms - e->rec.ts_ms : 0;
                     }
-                    log_open = lsc_writer_open(&w, path, wring_bitrate(), start_wall) == 0;
+                    const lsc_open_info_t info = {
+                        .start_wall_ms = start_wall_ms,
+                        .flags = LSC_FLAG_ANCHOR_MS_VALID | LSC_FLAG_BOOT_VALID,
+                        .boot_count = boot_count,
+                    };
+                    log_open = lsc_writer_open_ex(&w, path, wring_bitrate(), &info) == 0;
                     log_gen = e->gen;
                     wring_clear_close_before(log_gen);
                     if (log_open) {
                         snprintf(base_path, sizeof(base_path), "%s", path);
-                        log_start_wall = start_wall;
+                        log_start_wall_ms = start_wall_ms;
+                        log_boot = boot_count;
                         log_part = 0;
+                        reopen_path[0] = '\0';
+                        reopen_after_ms = 0;
                         wring_set_current_log(base_path);
+                        wring_set_log_error("");
                     } else {
+                        wring_set_log_error("open failed");
                         fprintf(stderr, TAG ": cannot open %s: %s\n", path, strerror(errno));
                     }
                 }
@@ -306,11 +421,18 @@ static void *writer_thread(void *arg)
                 log_open = false;
                 log_part++;
                 log_part_path(base_path, log_part, next, sizeof(next));
-                log_open = lsc_writer_open(&w, next, wring_bitrate(), log_start_wall) == 0;
+                const lsc_open_info_t info = {
+                    .start_wall_ms = log_start_wall_ms,
+                    .flags = LSC_FLAG_ANCHOR_MS_VALID | LSC_FLAG_BOOT_VALID,
+                    .boot_count = log_boot,
+                };
+                log_open = lsc_writer_open_ex(&w, next, wring_bitrate(), &info) == 0;
                 if (log_open) {
                     wring_set_current_log(next);
+                    wring_set_log_error("");
                     fprintf(stderr, TAG ": log rotated to %s\n", next);
                 } else {
+                    wring_set_log_error("rotate failed");
                     fprintf(stderr, TAG ": cannot rotate log to %s: %s\n", next,
                             strerror(errno));
                 }
@@ -318,13 +440,17 @@ static void *writer_thread(void *arg)
 
             if (lsc_writer_write(&w, &e->rec) != 0) {
                 fprintf(stderr, TAG ": log write failed: %s\n", strerror(errno));
-                /* The stream is in an error state; close it so the failure
-                 * does not repeat for every remaining record. These records
-                 * are counted as dropped below and the next session starts a
-                 * fresh file. */
+                wring_set_log_error("write failed");
+                /* Close the bad stream and try a fresh part in 2 s; one
+                 * transient error must not discard the rest of the session. */
                 lsc_writer_close(&w);
                 log_open = false;
-                break;
+                if (base_path[0]) {
+                    log_part++;
+                    log_part_path(base_path, log_part, reopen_path, sizeof(reopen_path));
+                }
+                reopen_after_ms = mono_ms() + 2000u;
+                continue; /* this record is counted as dropped */
             }
             ok++;
         }
@@ -350,6 +476,11 @@ static void *writer_thread(void *arg)
             if (log_open && wring_take_close(log_gen)) {
                 lsc_writer_close(&w);
                 log_open = false;
+                log_retention();
+            }
+            if (!log_open && wring_take_close(log_gen)) {
+                reopen_path[0] = '\0';
+                reopen_after_ms = 0;
             }
             if (!log_open) {
                 wring_clear_close();
@@ -382,10 +513,20 @@ typedef struct {
     int fd;
     linsight_parser_t parser;
     uint8_t payload[LINSIGHT_MAX_CAN_BATCH];
-    uint64_t recs;
-    char stats[512]; /* latest STATS JSON from the device */
+    uint64_t recs;   /* raw records received this session */
+    char stats[513]; /* latest STATS JSON from the device */
+    char info[513];  /* latest DEVICE_INFO JSON */
     time_t last_rx;
-    bool anchored; /* g_session_start mapped from the first record's uptime */
+    bool anchor_valid;
+    uint64_t anchor_wall_ms;
+    char device_id[16];
+    uint32_t boot_count;
+    session_state_t sess;
+
+    /* Epoll-owned output queue: callbacks only append; EPOLLOUT drains it. */
+    uint8_t out[DEV_OUT_CAP];
+    size_t out_off;
+    size_t out_len;
 } device_t;
 
 typedef struct {
@@ -397,6 +538,12 @@ typedef struct {
     uint32_t filter_id;
     int filter_ext; /* -1 = any, 0 = standard only, 1 = extended only */
     uint16_t pending_id; /* CONTROL id awaiting ACK, 0 = none */
+    uint64_t ack_deadline_ms;
+
+    uint8_t out[CLI_OUT_CAP];
+    size_t out_off;
+    size_t out_len;
+    bool close_after; /* close once the output queue drains */
 } cli_conn_t;
 
 static device_t g_dev = {.fd = -1};
@@ -404,7 +551,7 @@ static cli_conn_t g_cli[CLI_MAX];
 static int g_epoll = -1;
 static volatile sig_atomic_t g_stop;
 static uint16_t g_ctrl_id;
-static uint64_t g_session_start;
+static uint64_t g_session_start_ms;
 
 static void set_nonblock(int fd)
 {
@@ -412,44 +559,156 @@ static void set_nonblock(int fd)
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static bool send_all(int fd, const void *data, size_t len)
+static uint64_t mono_ms(void)
 {
-    const uint8_t *p = data;
-    size_t left = len;
-    while (left) {
-        const ssize_t n = send(fd, p, left, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* Socket buffer full: wait briefly instead of tearing down the
-                 * connection over a transient stall. */
-                struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-                if (poll(&pfd, 1, 2000) <= 0) {
-                    return false;
-                }
-                continue;
-            }
-            return false;
-        }
-        p += n;
-        left -= (size_t)n;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* ------------------------------------------------------- output queues */
+
+static void cli_close(cli_conn_t *c);
+static void device_close(void);
+
+static void device_update_epoll(void)
+{
+    if (g_dev.fd < 0) {
+        return;
     }
+    struct epoll_event ev = {
+        .events = EPOLLIN | (g_dev.out_len > g_dev.out_off ? EPOLLOUT : 0),
+        .data.u64 = 0,
+    };
+    epoll_ctl(g_epoll, EPOLL_CTL_MOD, g_dev.fd, &ev);
+}
+
+static void cli_update_epoll(cli_conn_t *c)
+{
+    if (c->fd < 0) {
+        return;
+    }
+    struct epoll_event ev = {
+        .events = EPOLLIN | (c->out_len > c->out_off ? EPOLLOUT : 0),
+        .data.u64 = 0x100u + (uint64_t)(c - g_cli),
+    };
+    epoll_ctl(g_epoll, EPOLL_CTL_MOD, c->fd, &ev);
+}
+
+/* Append one complete device frame. CONTROL/PONG are tiny; if the queue is
+ * full the frame is dropped rather than blocking the epoll loop. */
+static bool device_queue_frame(uint8_t type, const void *payload, uint16_t len)
+{
+    if (g_dev.fd < 0 || len > LINSIGHT_MAX_CONTROL) {
+        return false;
+    }
+    if (g_dev.out_off > 0) {
+        memmove(g_dev.out, g_dev.out + g_dev.out_off, g_dev.out_len - g_dev.out_off);
+        g_dev.out_len -= g_dev.out_off;
+        g_dev.out_off = 0;
+    }
+    const size_t total = LINSIGHT_FRAME_HEADER_SIZE + len;
+    if (total > sizeof(g_dev.out) - g_dev.out_len) {
+        return false;
+    }
+    linsight_frame_write_header(g_dev.out + g_dev.out_len, type, len);
+    if (len) {
+        memcpy(g_dev.out + g_dev.out_len + LINSIGHT_FRAME_HEADER_SIZE, payload, len);
+    }
+    g_dev.out_len += total;
+    device_update_epoll();
     return true;
 }
 
-static void send_frame(int fd, uint8_t type, const void *payload, uint16_t len)
+static void device_flush(void)
 {
-    uint8_t hdr[LINSIGHT_FRAME_HEADER_SIZE];
-    linsight_frame_write_header(hdr, type, len);
-    if (!send_all(fd, hdr, sizeof(hdr)) ||
-        (len && !send_all(fd, payload, len))) {
-        fprintf(stderr, TAG ": send_frame type %u failed: %s\n", type, strerror(errno));
+    if (g_dev.fd < 0) {
+        return;
     }
+    while (g_dev.out_off < g_dev.out_len) {
+        const ssize_t n = send(g_dev.fd, g_dev.out + g_dev.out_off,
+                               g_dev.out_len - g_dev.out_off, MSG_NOSIGNAL);
+        if (n > 0) {
+            g_dev.out_off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;
+        }
+        device_close();
+        return;
+    }
+    if (g_dev.out_off == g_dev.out_len) {
+        g_dev.out_off = 0;
+        g_dev.out_len = 0;
+    }
+    device_update_epoll();
 }
 
-static bool send_control_fields(int fd, const char *action, const char *fields)
+static bool cli_queue(cli_conn_t *c, const void *data, size_t len)
+{
+    if (c->fd < 0) {
+        return false;
+    }
+    if (c->out_off > 0) {
+        memmove(c->out, c->out + c->out_off, c->out_len - c->out_off);
+        c->out_len -= c->out_off;
+        c->out_off = 0;
+    }
+    if (len > sizeof(c->out) - c->out_len) {
+        return false;
+    }
+    memcpy(c->out + c->out_len, data, len);
+    c->out_len += len;
+    cli_update_epoll(c);
+    return true;
+}
+
+static void cli_flush(cli_conn_t *c)
+{
+    if (c->fd < 0) {
+        return;
+    }
+    while (c->out_off < c->out_len) {
+        const ssize_t n = send(c->fd, c->out + c->out_off, c->out_len - c->out_off,
+                               MSG_NOSIGNAL);
+        if (n > 0) {
+            c->out_off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;
+        }
+        cli_close(c);
+        return;
+    }
+    if (c->out_off == c->out_len) {
+        c->out_off = 0;
+        c->out_len = 0;
+        if (c->close_after) {
+            cli_close(c);
+            return;
+        }
+    }
+    cli_update_epoll(c);
+}
+
+static void cli_reply(cli_conn_t *c, const char *text)
+{
+    if (!cli_queue(c, text, strlen(text))) {
+        cli_close(c);
+        return;
+    }
+    c->close_after = true;
+}
+
+static bool send_control_fields(const char *action, const char *fields)
 {
     char json[LINSIGHT_MAX_CONTROL + 1];
     const bool has_fields = fields && fields[0];
@@ -459,18 +718,15 @@ static bool send_control_fields(int fd, const char *action, const char *fields)
     if (n <= 0 || n > (int)LINSIGHT_MAX_CONTROL) {
         return false;
     }
-    send_frame(fd, LINSIGHT_FRAME_CONTROL, json, (uint16_t)n);
-    return true;
+    return device_queue_frame(LINSIGHT_FRAME_CONTROL, json, (uint16_t)n);
 }
 
-static bool send_control(int fd, const char *action)
+static bool send_control(const char *action)
 {
-    return send_control_fields(fd, action, NULL);
+    return send_control_fields(action, NULL);
 }
 
 /* ------------------------------------------------------------- frames */
-
-static void cli_close(cli_conn_t *c);
 
 static void deliver_live(const linsight_can_record_t *recs, uint32_t n)
 {
@@ -493,25 +749,18 @@ static void deliver_live(const linsight_can_record_t *recs, uint32_t n)
             if (!formatted) {
                 /* Newline-terminated: `live` is a line-oriented stream for the
                  * CLI and the bench GUI. */
-                len = canlog_format_candump(&recs[i], g_session_start, line,
-                                            sizeof(line) - 1);
+                len = canlog_format_candump_ms(&recs[i], g_session_start_ms, line,
+                                               sizeof(line) - 1);
                 formatted = true;
                 if (len <= 0) {
                     break;
                 }
                 line[len++] = '\n';
             }
-            /* Best-effort: a slow `live` consumer must never stall the device
-             * RX / writer path. EAGAIN drops one line; a hard error or a
-             * partial line (would corrupt the stream) closes the client. */
-            const ssize_t sent = send(cli->fd, line, (size_t)len, MSG_NOSIGNAL);
-            if (sent == len) {
-                continue;
-            }
-            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                continue;
-            }
-            cli_close(cli);
+            /* Best-effort: queue for EPOLLOUT. A slow `live` consumer must
+             * never stall the device RX/writer path; a full queue drops this
+             * line rather than blocking or closing the client. */
+            (void)cli_queue(cli, line, (size_t)len);
         }
     }
 
@@ -549,52 +798,33 @@ static void handle_batch(const uint8_t *payload, uint16_t len)
         fprintf(stderr, TAG ": batch had %u invalid records\n", (unsigned)(count - valid));
     }
 
-    g_dev.recs += valid;
-    if (valid) {
-        if (!g_dev.anchored) {
-            /* Device ts_ms is uptime; anchor it to wall time once per session
-             * so `live` lines and exports show real dates. */
-            const uint64_t now_s = (uint64_t)time(NULL);
-            const uint64_t ts_s = recs[0].ts_ms / 1000u;
-            g_session_start = now_s > ts_s ? now_s - ts_s : now_s;
-            wring_set_anchor(g_session_start);
-            g_dev.anchored = true;
+    /* Dedupe against a reconnect backlog and count gaps; only accepted
+     * records reach the writer and live clients. */
+    uint32_t accepted = 0;
+    for (uint32_t i = 0; i < valid; i++) {
+        if (session_record_new(&g_dev.sess, &recs[i])) {
+            recs[accepted++] = recs[i];
         }
-        wring_push(recs, valid);
-        deliver_live(recs, valid);
     }
-}
+    g_dev.recs += valid;
 
-/* HELLO is e.g. {"...","bitrate":"500k","mode":"LISTEN"}; the host has no
- * JSON dependency and this is the only field it needs from that object. */
-static uint32_t parse_hello_bitrate(const uint8_t *payload, uint16_t len)
-{
-    char json[LINSIGHT_MAX_HELLO + 1];
-
-    if (len > LINSIGHT_MAX_HELLO) {
-        return 0;
+    if (accepted) {
+        if (!g_dev.anchor_valid) {
+            /* Old firmware without HELLO uptime: map the first record's
+             * uptime onto the current wall clock. */
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u +
+                                    (uint64_t)ts.tv_nsec / 1000000u;
+            g_dev.anchor_wall_ms =
+                now_ms > recs[0].ts_ms ? now_ms - recs[0].ts_ms : 0;
+            g_dev.anchor_valid = true;
+            g_session_start_ms = g_dev.anchor_wall_ms;
+            wring_set_anchor_info(g_dev.anchor_wall_ms, g_dev.boot_count);
+        }
+        wring_push(recs, accepted);
+        deliver_live(recs, accepted);
     }
-    memcpy(json, payload, len);
-    json[len] = '\0';
-
-    const char *key = strstr(json, "\"bitrate\":\"");
-    if (!key) {
-        return 0;
-    }
-    key += strlen("\"bitrate\":\"");
-    if (strncmp(key, "125k", 4) == 0) {
-        return 125000;
-    }
-    if (strncmp(key, "250k", 4) == 0) {
-        return 250000;
-    }
-    if (strncmp(key, "500k", 4) == 0) {
-        return 500000;
-    }
-    if (strncmp(key, "1M", 2) == 0) {
-        return 1000000;
-    }
-    return 0;
 }
 
 static void handle_frame(void *ctx, uint8_t type, const uint8_t *payload, uint16_t len)
@@ -603,9 +833,28 @@ static void handle_frame(void *ctx, uint8_t type, const uint8_t *payload, uint16
     switch (type) {
     case LINSIGHT_FRAME_HELLO: {
         fprintf(stderr, TAG ": device hello: %.*s\n", (int)len, (const char *)payload);
-        const uint32_t bitrate = parse_hello_bitrate(payload, len);
-        if (bitrate) {
-            wring_set_bitrate(bitrate);
+        session_hello_t h;
+        if (!session_parse_hello(payload, len, &h)) {
+            break;
+        }
+        if (h.bitrate) {
+            wring_set_bitrate(h.bitrate);
+        }
+        if (h.has_device_id) {
+            snprintf(g_dev.device_id, sizeof(g_dev.device_id), "%s", h.device_id);
+        }
+        g_dev.boot_count = h.boot_count;
+        session_reset(&g_dev.sess, h.boot_count, h.has_boot);
+        if (h.has_uptime) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u +
+                                    (uint64_t)ts.tv_nsec / 1000000u;
+            g_dev.anchor_wall_ms =
+                session_anchor_start_wall_ms(now_ms, h.uptime_ms);
+            g_dev.anchor_valid = true;
+            g_session_start_ms = g_dev.anchor_wall_ms;
+            wring_set_anchor_info(g_dev.anchor_wall_ms, h.boot_count);
         }
         break;
     }
@@ -613,16 +862,22 @@ static void handle_frame(void *ctx, uint8_t type, const uint8_t *payload, uint16
         handle_batch(payload, len);
         break;
     case LINSIGHT_FRAME_STATS:
-        if (len < sizeof(g_dev.stats)) {
+        if (len <= LINSIGHT_MAX_STATS) {
             memcpy(g_dev.stats, payload, len);
             g_dev.stats[len] = '\0';
+        }
+        break;
+    case LINSIGHT_FRAME_DEVICE_INFO:
+        if (len <= LINSIGHT_MAX_DEVICE_INFO) {
+            memcpy(g_dev.info, payload, len);
+            g_dev.info[len] = '\0';
         }
         break;
     case LINSIGHT_FRAME_EVENT:
         fprintf(stderr, TAG ": device event: %.*s\n", (int)len, (const char *)payload);
         break;
     case LINSIGHT_FRAME_PING:
-        send_frame(g_dev.fd, LINSIGHT_FRAME_PONG, payload, len);
+        (void)device_queue_frame(LINSIGHT_FRAME_PONG, payload, len);
         break;
     case LINSIGHT_FRAME_PONG:
         fprintf(stderr, TAG ": device pong (%u bytes)\n", (unsigned)len);
@@ -635,9 +890,14 @@ static void handle_frame(void *ctx, uint8_t type, const uint8_t *payload, uint16
         for (int c = 0; c < CLI_MAX; c++) {
             if (g_cli[c].fd >= 0 && g_cli[c].pending_id == (uint16_t)ack_id) {
                 g_cli[c].pending_id = 0;
-                send_all(g_cli[c].fd, ack, strlen(ack));
-                send_all(g_cli[c].fd, "\n", 1);
-                cli_close(&g_cli[c]); /* one reply, then EOF */
+                g_cli[c].ack_deadline_ms = 0;
+                char reply[80];
+                const int rn = snprintf(reply, sizeof(reply), "%s\n", ack);
+                if (rn <= 0 || !cli_queue(&g_cli[c], reply, (size_t)rn)) {
+                    cli_close(&g_cli[c]);
+                } else {
+                    g_cli[c].close_after = true; /* one reply, then EOF */
+                }
             }
         }
         break;
@@ -657,6 +917,8 @@ static void device_close(void)
     epoll_ctl(g_epoll, EPOLL_CTL_DEL, g_dev.fd, NULL);
     close(g_dev.fd);
     g_dev.fd = -1;
+    g_dev.out_off = 0;
+    g_dev.out_len = 0;
     fprintf(stderr, TAG ": device session ended (%llu records)\n",
             (unsigned long long)g_dev.recs);
     pthread_mutex_lock(&g_ring.lock);
@@ -686,9 +948,11 @@ static void device_accept(int listen_fd)
     g_dev.recs = 0;
     g_dev.last_rx = time(NULL);
     g_dev.stats[0] = '\0';
-    g_dev.anchored = false;
+    g_dev.info[0] = '\0';
+    g_dev.anchor_valid = false;
+    session_clear_counters(&g_dev.sess);
     linsight_parser_reset(&g_dev.parser);
-    g_session_start = (uint64_t)time(NULL);
+    g_session_start_ms = 0;
 
     struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 0}; /* u64 0 = device */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, fd, &ev);
@@ -725,6 +989,10 @@ static void cli_close(cli_conn_t *c)
     c->filter_id_valid = false;
     c->filter_ext = -1;
     c->pending_id = 0;
+    c->ack_deadline_ms = 0;
+    c->out_off = 0;
+    c->out_len = 0;
+    c->close_after = false;
     c->len = 0;
 }
 
@@ -831,23 +1099,33 @@ static bool build_config_fields(const char *args, char *out, size_t cap)
 static size_t build_stats_json(char *out, size_t cap)
 {
     char log_path[512];
+    char log_error[128];
     pthread_mutex_lock(&g_ring.lock);
     const uint64_t written = g_ring.written;
     const uint64_t dropped = g_ring.dropped;
     snprintf(log_path, sizeof(log_path), "%s", g_current_log);
+    snprintf(log_error, sizeof(log_error), "%s", g_ring.log_error);
     pthread_mutex_unlock(&g_ring.lock);
 
     const int n = snprintf(
         out, cap,
-        "{\"device\":%s,\"records\":%llu,\"written\":%llu,\"dropped\":%llu,"
-        "\"log\":\"%s\",\"stats\":%s}",
-        g_dev.fd >= 0 ? "true" : "false", (unsigned long long)g_dev.recs,
+        "{\"version\":\"0.3.0\",\"device\":%s,\"device_id\":\"%s\",\"boot\":%u,"
+        "\"records\":%llu,\"recv_raw\":%llu,\"backlog_skipped\":%llu,"
+        "\"seq_gaps\":%llu,\"seq_missing\":%llu,\"seq_ambiguous\":%llu,"
+        "\"written\":%llu,\"dropped\":%llu,\"log\":\"%s\",\"log_error\":\"%s\","
+        "\"anchor_wall_ms\":%llu,\"stats\":%s,\"info\":%s}",
+        g_dev.fd >= 0 ? "true" : "false", g_dev.device_id, (unsigned)g_dev.boot_count,
+        (unsigned long long)g_dev.sess.accepted, (unsigned long long)g_dev.recs,
+        (unsigned long long)g_dev.sess.skipped, (unsigned long long)g_dev.sess.gaps,
+        (unsigned long long)g_dev.sess.missing, (unsigned long long)g_dev.sess.ambiguous,
         (unsigned long long)written, (unsigned long long)dropped,
-        log_path[0] ? log_path : "", g_dev.stats[0] ? g_dev.stats : "{}");
-    if (n <= 0) {
+        log_path[0] ? log_path : "", log_error,
+        (unsigned long long)g_dev.anchor_wall_ms,
+        g_dev.stats[0] ? g_dev.stats : "{}", g_dev.info[0] ? g_dev.info : "{}");
+    if (n <= 0 || (size_t)n >= cap) {
         return 0;
     }
-    return (size_t)n >= cap ? cap - 1 : (size_t)n;
+    return (size_t)n;
 }
 
 /* Dashboard control endpoint: same whitelist as the CLI, ACK still goes to the
@@ -861,7 +1139,7 @@ static bool web_control(void *ctx, const char *cmd, char *err, size_t errcap)
             snprintf(err, errcap, "no device");
             return false;
         }
-        send_control(g_dev.fd, strcmp(cmd, "clear") == 0 ? "clear_stats" : cmd);
+        send_control(strcmp(cmd, "clear") == 0 ? "clear_stats" : cmd);
         return true;
     }
     if (strncmp(cmd, "config ", 7) == 0) {
@@ -874,7 +1152,7 @@ static bool web_control(void *ctx, const char *cmd, char *err, size_t errcap)
             snprintf(err, errcap, "no device");
             return false;
         }
-        if (!send_control_fields(g_dev.fd, LINSIGHT_CTRL_CONFIG, fields)) {
+        if (!send_control_fields(LINSIGHT_CTRL_CONFIG, fields)) {
             snprintf(err, errcap, "send failed");
             return false;
         }
@@ -902,18 +1180,22 @@ static void cli_dispatch(cli_conn_t *c)
     }
 
     if (strcmp(cmd, "stats") == 0) {
-        char out[1024];
+        char out[8192];
         size_t out_len = build_stats_json(out, sizeof(out) - 1);
-        if (out_len > 0 && out_len + 1 < sizeof(out)) {
-            out[out_len++] = '\n';
+        if (out_len == 0) {
+            cli_reply(c, "ERR stats unavailable\n");
+            return;
         }
-        send_all(c->fd, out, out_len);
-        cli_close(c);
+        out[out_len++] = '\n';
+        if (!cli_queue(c, out, out_len)) {
+            cli_close(c);
+            return;
+        }
+        c->close_after = true;
     } else if (strcmp(cmd, "live") == 0 ||
                (strncmp(cmd, "live ", 5) == 0)) {
         if (!parse_live_filters(c, cmd + 4)) {
-            send_all(c->fd, "ERR bad live filter\n", strlen("ERR bad live filter\n"));
-            cli_close(c);
+            cli_reply(c, "ERR bad live filter\n");
             return;
         }
         c->live = true; /* records stream until the client goes away */
@@ -921,34 +1203,49 @@ static void cli_dispatch(cli_conn_t *c)
                (cmd[6] == '\0' || cmd[6] == ' ')) {
         char fields[96];
         if (!build_config_fields(cmd + 6, fields, sizeof(fields))) {
-            send_all(c->fd, "ERR bad config\n", strlen("ERR bad config\n"));
-            cli_close(c);
+            cli_reply(c, "ERR bad config\n");
             return;
         }
         if (g_dev.fd < 0) {
-            send_all(c->fd, "ERR no device\n", strlen("ERR no device\n"));
-            cli_close(c);
+            cli_reply(c, "ERR no device\n");
             return;
         }
-        if (!send_control_fields(g_dev.fd, LINSIGHT_CTRL_CONFIG, fields)) {
-            send_all(c->fd, "ERR send failed\n", strlen("ERR send failed\n"));
-            cli_close(c);
+        if (!send_control_fields(LINSIGHT_CTRL_CONFIG, fields)) {
+            cli_reply(c, "ERR send failed\n");
             return;
         }
         c->pending_id = g_ctrl_id;
-    } else if (strcmp(cmd, "pause") == 0 || strcmp(cmd, "resume") == 0 ||
-               strcmp(cmd, "clear") == 0) {
+        c->ack_deadline_ms = mono_ms() + ACK_TIMEOUT_MS;
+    } else if (strcmp(cmd, "pause") == 0 || strncmp(cmd, "pause ", 6) == 0 ||
+               strcmp(cmd, "resume") == 0 || strcmp(cmd, "clear") == 0) {
         if (g_dev.fd < 0) {
-            send_all(c->fd, "ERR no device\n", strlen("ERR no device\n"));
-            cli_close(c);
+            cli_reply(c, "ERR no device\n");
             return;
         }
-        /* Device protocol names the action "clear_stats". */
-        send_control(g_dev.fd, strcmp(cmd, "clear") == 0 ? "clear_stats" : cmd);
+        /* Device protocol names the action "clear_stats"; pause may carry an
+         * optional lease so a dead host cannot leave the device paused. */
+        const char *action = strcmp(cmd, "clear") == 0 ? "clear_stats" : cmd;
+        char fields[48] = {0};
+        const char *lease = strstr(cmd, "lease=");
+        if (lease) {
+            char *end = NULL;
+            const unsigned long ms = strtoul(lease + 6, &end, 10);
+            if (end == lease + 6 || (*end && *end != ' ') ||
+                ms < LINSIGHT_PAUSE_LEASE_MIN_MS || ms > LINSIGHT_PAUSE_LEASE_MAX_MS) {
+                cli_reply(c, "ERR bad lease\n");
+                return;
+            }
+            snprintf(fields, sizeof(fields), "\"lease_ms\":%lu", ms);
+            action = "pause";
+        }
+        if (!send_control_fields(action, fields[0] ? fields : NULL)) {
+            cli_reply(c, "ERR send failed\n");
+            return;
+        }
         c->pending_id = g_ctrl_id;
+        c->ack_deadline_ms = mono_ms() + ACK_TIMEOUT_MS;
     } else {
-        send_all(c->fd, "ERR unknown command\n", strlen("ERR unknown command\n"));
-        cli_close(c);
+        cli_reply(c, "ERR unknown command\n");
     }
 }
 
@@ -1070,6 +1367,14 @@ int main(int argc, char **argv)
                 return 1;
             }
             g_log_max_bytes = mb * 1024ull * 1024ull; /* 0 keeps one file/session */
+        } else if (strcmp(argv[i], "--log-max-total-mb") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            const unsigned long long mb = strtoull(argv[++i], &end, 10);
+            if (end == argv[i] || *end || mb > 1024ull * 1024ull) {
+                fprintf(stderr, "linsightd: bad total log size '%s'\n", argv[i]);
+                return 1;
+            }
+            g_log_max_total_bytes = mb * 1024ull * 1024ull;
         } else if (strcmp(argv[i], "--http-port") == 0 && i + 1 < argc) {
             const int p = atoi(argv[++i]);
             if (p < 0 || p > 65535) {
@@ -1085,8 +1390,8 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "usage: linsightd [--port N] [--ctl PATH] [--ctl-port N] "
                     "[--log-dir DIR]\n"
-                    "                  [--log-max-mb N] [--http-port N] "
-                    "[--http-bind ADDR] [--web-dir DIR]\n");
+                    "                  [--log-max-mb N] [--log-max-total-mb N] "
+                    "[--http-port N] [--http-bind ADDR] [--web-dir DIR]\n");
             return 1;
         }
     }
@@ -1171,8 +1476,8 @@ int main(int argc, char **argv)
 
     uint64_t last_recs = 0;
     while (!g_stop) {
-        struct epoll_event events[8];
-        const int n = epoll_wait(g_epoll, events, 8, -1);
+        struct epoll_event events[MAX_EVENTS];
+        const int n = epoll_wait(g_epoll, events, MAX_EVENTS, -1);
         for (int i = 0; i < n; i++) {
             const uint64_t tag = events[i].data.u64;
             cli_conn_t *cli = NULL;
@@ -1206,6 +1511,20 @@ int main(int argc, char **argv)
                         (unsigned long long)(g_dev.recs - last_recs),
                         (unsigned long long)written, (unsigned long long)dropped);
                 last_recs = g_dev.recs;
+
+                /* A device that never ACKs must not leave the CLI hanging
+                 * until its own 5 s receive timeout. */
+                const uint64_t now_m = mono_ms();
+                for (int c = 0; c < CLI_MAX; c++) {
+                    cli_conn_t *cc = &g_cli[c];
+                    if (cc->fd < 0 || cc->pending_id == 0 || cc->ack_deadline_ms == 0 ||
+                        now_m < cc->ack_deadline_ms) {
+                        continue;
+                    }
+                    cc->pending_id = 0;
+                    cc->ack_deadline_ms = 0;
+                    cli_reply(cc, "ERR ack timeout\n");
+                }
             } else if (tag == 1) {
                 device_accept(tcp_fd);
             } else if (tag == 2) {
@@ -1213,6 +1532,16 @@ int main(int argc, char **argv)
             } else if (tag == 5) {
                 cli_accept(ctl_tcp_fd);
             } else if (tag == 0) { /* device socket */
+                const uint32_t revents = events[i].events;
+                if (revents & EPOLLOUT) {
+                    device_flush();
+                }
+                if (g_dev.fd < 0) {
+                    continue;
+                }
+                if (!(revents & (EPOLLIN | EPOLLERR | EPOLLHUP))) {
+                    continue;
+                }
                 uint8_t rx[RX_BUF_SIZE];
                 const ssize_t got = recv(g_dev.fd, rx, sizeof(rx), 0);
                 if (got <= 0) {
@@ -1235,9 +1564,22 @@ int main(int argc, char **argv)
                 http_server_handle(g_http, (int)(tag - HTTP_TAG_CLIENT_BASE),
                                    events[i].events);
             } else { /* cli conn */
+                const uint32_t revents = events[i].events;
+                if (revents & EPOLLOUT) {
+                    cli_flush(cli);
+                }
+                if (cli->fd < 0) {
+                    continue;
+                }
+                if (!(revents & (EPOLLIN | EPOLLERR | EPOLLHUP))) {
+                    continue;
+                }
                 const ssize_t got =
                     recv(cli->fd, cli->buf + cli->len, sizeof(cli->buf) - (size_t)cli->len, 0);
                 if (got <= 0) {
+                    if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        continue;
+                    }
                     cli_close(cli);
                     continue;
                 }
