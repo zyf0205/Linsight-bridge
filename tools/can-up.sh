@@ -37,9 +37,14 @@ state() {
 }
 
 if [ "${1:-}" = "--status" ]; then
-    if [ -x "$USBIPD" ] || [ -f "$USBIPD" ]; then
+    if [ -f "$USBIPD" ]; then
         echo "== Windows (usbipd) =="
-        "$USBIPD" list 2>/dev/null | grep -Ei "peak|BUSID" || true
+        # Show the connected list and any persisted (bound) PEAK adapters; the
+        # busid to attach is usually in the persisted section.
+        "$USBIPD" list 2>/dev/null |
+            grep -Ei "pcan|peak|BUSID|Persisted|Connected|GUID" || true
+    else
+        echo "== Windows (usbipd) == not installed at $USBIPD"
     fi
     state
     exit 0
