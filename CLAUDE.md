@@ -12,6 +12,7 @@ Layout:
 - `host/src/` — daemon, `.lsc` writer/reader, replay, compare, DBC, device session, HTTP/SSE
 - `host/cli/` — stats/live/config/pause/resume/clear/export/replay/compare/decode
 - `host/web/index.html` — single-file dashboard (served by `linsightd`, no build step)
+- `host/web/CLAUDE.md` — dashboard data contract and constraints
 - `host/systemd/` — service unit + `/etc/default` args (CMake `install` targets)
 - `host/tests/` — record/parser/fuzz/ring/canlog/compare/dbc/session/export/import/integration/rotation
 - `protocol/` — shared v2.1 parser (mirror of the firmware repo)
