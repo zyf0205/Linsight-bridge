@@ -11,8 +11,8 @@
 - 零动态内存：控件一次创建；刷新只用静态缓冲 + `lv_label_set_text_static()`。
 - 两个物理页容器：Monitor 容器内放 Overview / Raw 两个互斥 group，Settings 为另一页；
   无滚动、无 shadow/渐变/半透明叠加；draw buffer 常驻内部 DMA（320×40×2）。
-- 启动动画：`lv_layer_top()` 全屏遮罩，`LinSight` 品牌与 `CAN ANALYZER` 淡入，1.2 s
-  后淡出并删除；期间遮罩吸收触摸。
+- 启动动画：`lv_layer_top()` 全屏遮罩，`LinSight` 品牌与 `CAN ANALYZER` 静态显示；
+  蓝色下划线由中心向两侧生长到 40 px 后直接进入主界面（无淡入淡出），期间遮罩吸收触摸。
 - 断网/无主机时本地采集、过滤、触发、统计照常工作。
 
 ## 2. 色板
