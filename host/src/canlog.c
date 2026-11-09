@@ -65,11 +65,6 @@ int lsc_writer_open_ex(lsc_writer_t *w, const char *path, uint32_t bitrate,
     linsight_put_u32(hdr + 24, boot_count);
     linsight_put_u32(hdr + 28, anchor_ms);
 
-    w->bitrate = bitrate;
-    w->flags = flags;
-    w->boot_count = boot_count;
-    w->start_wall = start_wall;
-    w->start_wall_ms = start_wall_ms;
     if (fwrite(hdr, 1, LSC_HEADER_SIZE, w->f) != LSC_HEADER_SIZE) {
         fclose(w->f);
         w->f = NULL;
@@ -104,24 +99,44 @@ int lsc_writer_write(lsc_writer_t *w, const linsight_can_record_t *r)
 
 int lsc_writer_flush(lsc_writer_t *w)
 {
-    return fflush(w->f) == 0 ? 0 : -1;
+    if (!w->f) {
+        errno = EBADF;
+        return -1;
+    }
+    const bool failed = ferror(w->f) != 0;
+    const int rc = fflush(w->f);
+    if (failed || rc != 0 || ferror(w->f)) {
+        if (rc == 0) {
+            errno = EIO;
+        }
+        return -1;
+    }
+    return 0;
 }
 
 int lsc_writer_sync(lsc_writer_t *w)
 {
-    if (!w->f || fflush(w->f) != 0) {
+    if (lsc_writer_flush(w) != 0) {
         return -1;
     }
     return fdatasync(fileno(w->f)) == 0 ? 0 : -1;
 }
 
-void lsc_writer_close(lsc_writer_t *w)
+int lsc_writer_close(lsc_writer_t *w)
 {
-    if (w->f) {
-        fflush(w->f);
-        fclose(w->f);
-        w->f = NULL;
+    if (!w->f) {
+        return 0;
     }
+    FILE *f = w->f;
+    const int rc = lsc_writer_flush(w);
+    const int saved = rc != 0 ? errno : 0;
+    w->f = NULL;
+    const int closed = fclose(f);
+    if (rc != 0) {
+        errno = saved;
+        return -1;
+    }
+    return closed == 0 ? 0 : -1;
 }
 
 int lsc_reader_open(lsc_reader_t *r, const char *path)
@@ -195,25 +210,9 @@ void lsc_reader_close(lsc_reader_t *r)
     }
 }
 
-long lsc_read(const char *path, lsc_record_cb cb, void *ctx)
-{
-    lsc_reader_t r;
-    if (lsc_reader_open(&r, path) != 0) {
-        return -1;
-    }
-
-    long count = 0;
-    linsight_can_record_t rec;
-    int rc;
-    while ((rc = lsc_reader_next(&r, &rec)) == 1) {
-        cb(&rec, ctx);
-        count++;
-    }
-    lsc_reader_close(&r);
-    return rc < 0 ? -1 : count;
-}
-
 /* ------------------------------------------------------------ exports */
+
+typedef void (*lsc_record_cb)(const linsight_can_record_t *r, void *ctx);
 
 typedef struct {
     FILE *out;
@@ -340,16 +339,6 @@ static long export_common(const char *lsc_path, const char *out_path, lsc_record
         return -1;
     }
     return rc < 0 ? -1 : e.count;
-}
-
-long canlog_export_asc(const char *lsc_path, const char *out_path)
-{
-    return export_common(lsc_path, out_path, export_asc_cb, NULL);
-}
-
-long canlog_export_candump(const char *lsc_path, const char *out_path)
-{
-    return export_common(lsc_path, out_path, export_candump_cb, NULL);
 }
 
 long canlog_export_asc_filtered(const char *lsc_path, const char *out_path,

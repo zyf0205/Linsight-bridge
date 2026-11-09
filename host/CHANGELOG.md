@@ -2,17 +2,20 @@
 
 ## Unreleased
 
-- Built-in traffic simulator (`src/sim.c`): `engine`/`bms`/`mix`/`counter`
-  patterns at 1–1000 fps plus one-shot inject, driven from a 10 Hz timerfd in
-  the daemon's epoll loop. Simulated frames reuse the real ingest path (writer
-  ring, CLI `live`, SSE) and carry a monotone `seq`, so `verify --strict` is
-  clean. No hardware and no device needed; sim traffic never reaches the bus.
-- CLI `sim start|stop|status|inject`; dashboard Simulate row; `sim` object in
-  `/api/stats` and `linsight-cli stats`.
+- Remove unused log APIs and writer metadata copies; keep the sequential
+  reader and filtered exports as the common paths.
+- Keep idle CLI live subscriptions open; report read errors and initialize
+  statistics when verification fails.
+- Check buffered log flush/close errors, retry initial open failures, and
+  apply oldest-first retention during active rotation and ongoing writes.
+- Stream and strictly validate soak captures against the generator's actual
+  sent count; add CLI, storage-failure and offline tool regressions.
+- Bound dashboard ID eviction without clearing the entire table; reset stale
+  inspector values and release CSV download URLs.
 - One-shot USB-CAN bench bring-up: `tools/can-up.sh` / `tools/can-down.sh`
   wrap `usbipd attach`, `modprobe peak_usb`, bitrate configuration and
   `ip link set can0 up`, with `--status` for diagnostics.
-- `test_sim` added; suite is 13 tests.
+- Regression suite: 14 CTest entries, including offline tool and CLI checks.
 
 ## v0.3.0 — 2026-11-08
 

@@ -3,8 +3,11 @@
 #
 # Brings can0 down and hands the device back to Windows, so the PCAN can be
 # used from Windows tools or safely unplugged.
+# Usage: ./can-down.sh [BUSID] (default 2-1, matching can-up.sh).
 
 set -u
+
+BUSID="${1:-2-1}"
 
 USBIPD="/mnt/c/Program Files/usbipd-win/usbipd.exe"
 
@@ -17,11 +20,8 @@ fi
 
 echo "[2/2] usbipd detach"
 if [ -f "$USBIPD" ]; then
-    # Detach any WSL-attached busid; ignore failures when nothing is attached.
-    "$USBIPD" list 2>/dev/null | awk '/Attached/ {print $1}' | while read -r busid; do
-        echo "  detaching $busid"
-        "$USBIPD" detach --busid "$busid" 2>&1 || true
-    done
+    echo "  detaching $BUSID"
+    "$USBIPD" detach --busid "$BUSID" 2>&1 || true
 else
     echo "  usbipd not found (skipped)"
 fi

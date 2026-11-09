@@ -352,6 +352,13 @@ static int cmd_live(int argc, char **argv)
         return 1;
     }
 
+    /* A live subscription can remain idle indefinitely, including with filters. */
+    const struct timeval no_timeout = {0};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &no_timeout, sizeof(no_timeout)) != 0) {
+        perror("linsight-cli: live timeout");
+        close(fd);
+        return 1;
+    }
     FILE *in = fdopen(fd, "r");
     if (!in) {
         perror("fdopen");
@@ -372,8 +379,12 @@ static int cmd_live(int argc, char **argv)
         }
         fflush(stdout);
     }
+    const bool failed = ferror(in) != 0;
+    if (failed) {
+        fprintf(stderr, "linsight-cli: live read failed: %s\n", strerror(errno));
+    }
     fclose(in); /* closes fd */
-    return 0;
+    return failed ? 1 : 0;
 }
 
 static int cmd_config(int argc, char **argv)
@@ -696,7 +707,7 @@ static int cmd_verify(int argc, char **argv)
         }
     }
 
-    lsc_import_info_t info;
+    lsc_import_info_t info = {0};
     char err[256] = {0};
     const int rc = lsc_verify(path, strict, &info, err, sizeof(err));
     printf("verify: records=%llu boot=%u bitrate=%u flags=0x%X uptime_only=%d "

@@ -10,6 +10,7 @@ Usage: rotation.py <linsightd-path>
 import glob
 import json
 import os
+import resource
 import signal
 import socket
 import struct
@@ -77,7 +78,14 @@ def main():
         print(__doc__)
         sys.exit(1)
     daemon = sys.argv[1]
-    tmp = tempfile.mkdtemp(prefix="linsight-rotate-")
+    with tempfile.TemporaryDirectory(prefix="linsight-rotate-") as tmp:
+        check_rotation(daemon, tmp)
+    check_retention(daemon)
+    check_open_retry(daemon)
+    check_buffered_failure(daemon)
+
+
+def check_rotation(daemon, tmp):
     log_dir = os.path.join(tmp, "logs")
     port = free_port()
     ctl_port = free_port()
@@ -147,6 +155,108 @@ def main():
             err = proc.stderr.read().decode(errors="replace")
             print("--- daemon stderr ---")
             print(err[-2000:])
+
+
+def stop_daemon(proc):
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+
+
+def start_daemon(daemon, tmp, extra=(), preexec_fn=None):
+    port, ctl_port = free_port(), free_port()
+    proc = subprocess.Popen(
+        [daemon, "--port", str(port), "--ctl", os.path.join(tmp, "ctl.sock"),
+         "--ctl-port", str(ctl_port), "--log-dir", os.path.join(tmp, "logs"),
+         "--http-port", "0", *extra],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, preexec_fn=preexec_fn)
+    dev = wait_port(port, proc)
+    dev.sendall(frame(1, b'{"proto":33,"fw":"2.1.0","device":"fake"}'))
+    return proc, dev, ctl_port
+
+
+def send_records(dev, start, count):
+    for first in range(start, start + count, BATCH):
+        n = min(BATCH, start + count - first)
+        body = struct.pack("<H", n)
+        for i in range(first, first + n):
+            body += REC.pack(i & 0xFFFF, i, 0x123, 0, 8,
+                             i.to_bytes(4, "little") + b"\x11\x22\x33\x44")
+        dev.sendall(frame(2, body))
+
+
+def wait_stats(ctl_port, predicate, timeout=10):
+    deadline = time.monotonic() + timeout
+    last = {}
+    while time.monotonic() < deadline:
+        last = json.loads(ctl_roundtrip(ctl_port, b"stats\n"))
+        if predicate(last):
+            return last
+        time.sleep(0.05)
+    fail(f"stats condition timed out: {last}")
+
+
+def check_retention(daemon):
+    with tempfile.TemporaryDirectory(prefix="linsight-retain-") as tmp:
+        proc, dev, ctl_port = start_daemon(
+            daemon, tmp, ["--log-max-mb", "1", "--log-max-total-mb", "1"])
+        try:
+            send_records(dev, 0, 120000)
+            wait_stats(ctl_port, lambda s: s.get("written") == 120000)
+            time.sleep(1.1)
+            send_records(dev, 120000, 1)
+            st = wait_stats(ctl_port, lambda s: s.get("written") == 120001)
+            files = glob.glob(os.path.join(tmp, "logs", "*.lsc"))
+            if len(files) != 1 or files[0] != st["log"]:
+                fail(f"retention did not run during the active session: {files}")
+            if os.path.getsize(files[0]) > MAX_BYTES or st.get("dropped") != 0:
+                fail(f"invalid retained part or drops: {st}")
+            print("retention: active rotation removes old parts and protects current log")
+        finally:
+            dev.close()
+            stop_daemon(proc)
+
+
+def check_open_retry(daemon):
+    with tempfile.TemporaryDirectory(prefix="linsight-open-retry-") as tmp:
+        proc, dev, ctl_port = start_daemon(daemon, tmp)
+        log_dir = os.path.join(tmp, "logs")
+        try:
+            os.rmdir(log_dir)
+            send_records(dev, 0, 1)
+            wait_stats(ctl_port, lambda s: s.get("dropped") == 1 and s.get("log_error"))
+            os.mkdir(log_dir)
+            time.sleep(2.1)
+            send_records(dev, 1, 1)
+            st = wait_stats(ctl_port, lambda s: s.get("written") == 1)
+            if st.get("log_error") or st.get("dropped") != 1:
+                fail(f"initial open did not recover in the same session: {st}")
+            print("open recovery: initial failure retries without device reconnect")
+        finally:
+            dev.close()
+            stop_daemon(proc)
+
+
+def check_buffered_failure(daemon):
+    def limit_file():
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (LSC_HEADER, LSC_HEADER))
+
+    with tempfile.TemporaryDirectory(prefix="linsight-flush-failure-") as tmp:
+        proc, dev, ctl_port = start_daemon(daemon, tmp, preexec_fn=limit_file)
+        try:
+            send_records(dev, 0, 1)
+            st = wait_stats(ctl_port, lambda s: s.get("dropped") == 1)
+            if st.get("written") != 0 or st.get("log_error") != "flush failed":
+                fail(f"buffered write failure reported as success: {st}")
+            print("write failure: failed fflush reports an error and no committed records")
+        finally:
+            dev.close()
+            stop_daemon(proc)
 
 
 if __name__ == "__main__":

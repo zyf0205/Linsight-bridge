@@ -106,17 +106,23 @@ int lsc_import(const char *src, const char *dst, bool have_boot_wall,
     int rc;
     while ((rc = lsc_reader_next(&rd, &rec)) == 1) {
         if (lsc_writer_write(&w, &rec) != 0) {
+            const int saved = errno;
             lsc_writer_close(&w);
             lsc_reader_close(&rd);
-            snprintf(err, errcap, "write failed: %s", strerror(errno));
+            snprintf(err, errcap, "write failed: %s", strerror(saved));
             return -1;
         }
         info.records++;
     }
-    lsc_writer_close(&w);
+    const int close_rc = lsc_writer_close(&w);
+    const int close_errno = errno;
     lsc_reader_close(&rd);
     if (rc < 0) {
         snprintf(err, errcap, "read failed in %s", src);
+        return -1;
+    }
+    if (close_rc != 0) {
+        snprintf(err, errcap, "close failed: %s", strerror(close_errno));
         return -1;
     }
 

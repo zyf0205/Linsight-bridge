@@ -84,6 +84,11 @@ if(Python3_FOUND)
     add_test(NAME rotation
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/rotation.py
                      $<TARGET_FILE:linsightd>)
+    add_test(NAME cli
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.py
+                     $<TARGET_FILE:linsight-cli>)
+    add_test(NAME tools
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tools.py)
 endif()
 
 # Install: binaries, single-file dashboard, systemd unit + /etc/default args.

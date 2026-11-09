@@ -21,11 +21,14 @@ import datetime
 import glob
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 import urllib.request
+
+from can_soak import verify_file
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DAEMON = os.path.join(ROOT, "host", "build", "linsightd")
@@ -130,36 +133,54 @@ def _fds(pid):
         return ""
 
 
-def count_records(path):
-    size = os.path.getsize(path)
-    return max(0, (size - 32) // 20)
+def log_part_key(path):
+    """Order numeric session/part suffixes, including files with equal mtimes."""
+    match = re.fullmatch(r"can-(\d{8}-\d{6})-(\d+)(?:-p(\d+))?\.lsc",
+                         os.path.basename(path))
+    if match:
+        return (0, match[1], int(match[2]), int(match[3] or 0))
+    return (1, os.path.getmtime(path), path)
 
 
-def verify_parts(log_dir, can_id, log_path):
-    files = sorted(glob.glob(os.path.join(log_dir, "*.lsc")),
-                   key=lambda p: (os.path.getmtime(p), p))
-    offset = 0
+def generator_sent(path):
+    """Read the generator's final structured result; missing evidence fails."""
+    result = None
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("result: "):
+                    result = json.loads(line[len("result: "):])
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(result, dict) or type(result.get("sent")) is not int or
+            result["sent"] < 0):
+        return None
+    return result["sent"]
+
+
+def verify_parts(log_dir, can_id, log_path, expected_sent=None):
+    files = sorted(glob.glob(os.path.join(log_dir, "*.lsc")), key=log_part_key)
     total = 0
+    matched = 0
     ok = True
     with open(log_path, "w", encoding="utf-8") as out:
         for path in files:
-            n = count_records(path)
-            if n == 0:
-                continue
-            cmd = [sys.executable, CAN_SOAK, "--verify", path,
-                   "--expect", str(n), "--first", str(offset), "--id", can_id]
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            out.write(f"{os.path.basename(path)}: {r.stdout.strip()}")
-            if r.stderr.strip():
-                out.write(f" | {r.stderr.strip()}")
-            out.write("\n")
-            out.flush()
-            if r.returncode != 0:
+            try:
+                result = verify_file(path, int(can_id, 0), first=matched,
+                                     allow_empty=True)
+            except (OSError, ValueError) as exc:
+                out.write(f"{os.path.basename(path)}: FAIL: {exc}\n")
                 ok = False
                 break
-            offset += n
-            total += n
-    return ok, total, len(files)
+            total += result["records"]
+            matched += result["matched"]
+            out.write(f"{os.path.basename(path)}: records={result['records']} "
+                      f"matched={result['matched']} next={result['next']}\n")
+        if expected_sent is None or matched != expected_sent or matched == 0:
+            out.write(f"FAIL: captured={matched} generator_sent={expected_sent} "
+                      f"total_records={total}\n")
+            ok = False
+    return ok, matched, len(files)
 
 
 def main():
@@ -211,6 +232,8 @@ def main():
         f.write(f"{daemon.pid}\n")
 
     gen = None
+    gen_log = None
+    generator_log_path = os.path.join(report, "generator.log")
     status = "failed"
     verify_ok = False
     total_records = 0
@@ -231,7 +254,7 @@ def main():
         gen_cmd = [sys.executable, CAN_SOAK, "--iface", args.iface,
                    "--rate", str(args.rate), "--duration", str(args.duration),
                    "--id", args.id]
-        gen_log = open(os.path.join(report, "generator.log"), "w", encoding="utf-8")
+        gen_log = open(generator_log_path, "w", encoding="utf-8")
         gen = subprocess.Popen(gen_cmd, stdout=gen_log, stderr=subprocess.STDOUT,
                                text=True)
         with open(os.path.join(report, "generator.pid"), "w", encoding="ascii") as f:
@@ -261,7 +284,7 @@ def main():
                 gen.kill()
                 gen.wait()
             prev = take_sample(writer, api, daemon, prev, counters)
-        status = "done" if gen.returncode == 0 else "generator-error"
+        status = "stopped" if STOP else ("done" if gen.returncode == 0 else "generator-error")
         print(f"generator exit={gen.returncode}; draining writer", flush=True)
         wait_drain(api, daemon)
     except Exception as exc:
@@ -277,11 +300,13 @@ def main():
             except subprocess.TimeoutExpired:
                 daemon.kill()
                 daemon.wait()
+        if gen_log:
+            gen_log.close()
         daemon_log.close()
 
+    sent = generator_sent(generator_log_path) if gen else None
     verify_log = os.path.join(report, "verify.log")
-    verify_ok, total_records, parts = verify_parts(log_dir, args.id, verify_log)
-    verify_ok = verify_ok and total_records > 0
+    verify_ok, total_records, parts = verify_parts(log_dir, args.id, verify_log, sent)
     end = time.time()
     summary = [
         "LinSight soak report",
@@ -291,6 +316,7 @@ def main():
         f"elapsed_s: {end - start:.0f}",
         f"target_rate_fps: {args.rate}",
         f"generator_exit: {gen.returncode if gen else 'not-started'}",
+        f"generator_sent: {sent if sent is not None else 'unavailable'}",
         f"status: {status}",
         f"device_down_samples: {counters['down']}",
         f"device_disconnect_samples: {counters['disconnects']}",

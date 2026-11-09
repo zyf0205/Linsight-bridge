@@ -87,7 +87,6 @@ int main(void)
     CHECK(info.cap == 8);
     CHECK(info.used == 8);
     CHECK(info.dropped == 12);
-    CHECK(info.stored == 20);
 
     linsight_can_record_t out[8];
     uint32_t n = can_ring_pop(out, 8);

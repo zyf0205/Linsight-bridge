@@ -32,11 +32,6 @@ typedef struct {
 typedef struct {
     FILE *f;
     uint64_t written;
-    uint32_t bitrate;
-    uint32_t flags;
-    uint32_t boot_count;
-    uint64_t start_wall;    /* unix seconds at uptime 0 (compat) */
-    uint64_t start_wall_ms; /* full millisecond anchor */
 } lsc_writer_t;
 
 int lsc_writer_open(lsc_writer_t *w, const char *path, uint32_t bitrate, uint64_t start_wall);
@@ -47,11 +42,8 @@ int lsc_writer_write(lsc_writer_t *w, const linsight_can_record_t *r);
 int lsc_writer_flush(lsc_writer_t *w);
 /* fflush + fdatasync; call at most once per second on slow storage. */
 int lsc_writer_sync(lsc_writer_t *w);
-void lsc_writer_close(lsc_writer_t *w);
-
-/* Returns the number of records passed to cb, or -1 on open error. */
-typedef void (*lsc_record_cb)(const linsight_can_record_t *r, void *ctx);
-long lsc_read(const char *path, lsc_record_cb cb, void *ctx);
+/* Close always clears f; returns -1 on an existing stream or flush/close error. */
+int lsc_writer_close(lsc_writer_t *w);
 
 /* Sequential reader used by replay/compare. lsc_reader_open validates the
  * magic and version. lsc_reader_next returns 1 on a record, 0 at EOF, -1 on a
@@ -85,8 +77,6 @@ typedef struct {
 } lsc_filter_t;
 
 /* Exports. Both return the number of frames written, or -1. */
-long canlog_export_asc(const char *lsc_path, const char *out_path);
-long canlog_export_candump(const char *lsc_path, const char *out_path);
 long canlog_export_asc_filtered(const char *lsc_path, const char *out_path,
                                 const lsc_filter_t *filter);
 long canlog_export_candump_filtered(const char *lsc_path, const char *out_path,

@@ -404,7 +404,8 @@ footer{
       const bytes = splitBytes(f);
       let c = state.counts.get(k);
       if (!c) {
-        c = { key: k, id: f.i, ext: isExt(f), n: 0, lastT: f.t, dt: 0, prev: bytes, chg: 0, last: f };
+        if (state.counts.size >= 512) state.counts.delete(state.counts.keys().next().value);
+        c = { id: f.i, ext: isExt(f), n: 0, lastT: f.t, dt: 0, prev: bytes, chg: 0, last: f };
       } else {
         if (f.t >= c.lastT) c.dt = f.t - c.lastT;
         c.lastT = f.t;
@@ -424,14 +425,16 @@ footer{
       state.rows.push(f);
     }
     if (state.rows.length > 900) state.rows.splice(0, state.rows.length - 900);
-    if (state.counts.size > 512) state.counts.clear();
     schedule();
   }
 
   function schedule() {
     if (state.frozen || renderPending) return;
     renderPending = true;
-    requestAnimationFrame(() => { renderPending = false; render(); });
+    requestAnimationFrame(() => {
+      renderPending = false;
+      if (!state.frozen) render();
+    });
   }
 
   function render() {
@@ -493,7 +496,11 @@ footer{
 
   function renderInspector() {
     const c = state.selKey ? state.counts.get(state.selKey) : null;
-    if (!c || !c.last) return;
+    if (!c || !c.last) {
+      $("inspText").textContent = "点击任意帧行查看二进制位与整数值";
+      $("inspBits").textContent = "";
+      return;
+    }
     const f = c.last;
     const bytes = f._bytes || splitBytes(f);
     const nums = bytes.map((b) => parseInt(b, 16));
@@ -662,7 +669,13 @@ footer{
       const r = await fetch("/api/control?cmd=" + encodeURIComponent(cmd), { cache: "no-store" });
       const j = await r.json();
       if (j.ok) {
-        if (cmd === "clear") { state.rows = []; state.counts.clear(); state.peakFps = 0; render(); }
+        if (cmd === "clear") {
+          state.rows = [];
+          state.counts.clear();
+          state.selKey = null;
+          state.peakFps = 0;
+          render();
+        }
         const label = cmd === "pause" ? "暂停" : cmd === "resume" ? "恢复"
           : cmd === "clear" ? "清除" : "配置";
         toast(label + "指令已发送");
@@ -726,9 +739,11 @@ footer{
     const lines = ["time_ms,id_hex,type,dlc,data_hex"];
     for (const f of state.rows) lines.push(`${f.t},${hexId(f)},${typeOf(f)},${f.d},${f.b || ""}`);
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
+    const url = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
+    a.href = url;
     a.download = `linsight-${Date.now()}.csv`;
     a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
     toast(`已导出 ${state.rows.length} 帧`);
   };
 

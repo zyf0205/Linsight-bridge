@@ -21,12 +21,6 @@ static int g_fail;
 static char g_path[64];
 static char g_out[64];
 
-static void noop_cb(const linsight_can_record_t *r, void *ctx)
-{
-    (void)r;
-    (void)ctx;
-}
-
 static long count_lines(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -123,16 +117,17 @@ static void corrupt_byte(size_t offset, unsigned char value)
 
 static void test_rejects_bad_header(void)
 {
+    lsc_reader_t r;
     write_sample();
     corrupt_byte(4, 2); /* version */
     errno = 0;
-    CHECK(lsc_read(g_path, noop_cb, NULL) == -1);
+    CHECK(lsc_reader_open(&r, g_path) == -1);
     CHECK(errno == EPROTO);
 
     write_sample();
     corrupt_byte(0, 'X'); /* magic */
     errno = 0;
-    CHECK(lsc_read(g_path, noop_cb, NULL) == -1);
+    CHECK(lsc_reader_open(&r, g_path) == -1);
     CHECK(errno == EPROTO);
 
     /* A truncated tail record is tolerated, not treated as corruption. */
@@ -145,7 +140,6 @@ static void test_rejects_bad_header(void)
     const unsigned char tail[7] = {1, 2, 3, 4, 5, 6, 7};
     CHECK(fwrite(tail, 1, sizeof(tail), f) == sizeof(tail));
     fclose(f);
-    lsc_reader_t r;
     CHECK(lsc_reader_open(&r, g_path) == 0);
     int n = 0;
     linsight_can_record_t rec;
@@ -236,6 +230,48 @@ static void test_header_extensions(void)
     lsc_reader_close(&r);
 }
 
+static void test_writer_errors(void)
+{
+    lsc_writer_t w = {0};
+    CHECK(lsc_writer_flush(&w) == -1);
+    CHECK(lsc_writer_sync(&w) == -1);
+    CHECK(lsc_writer_close(&w) == 0);
+
+    /* A buffered stream reports ENOSPC only when flushed/closed. */
+    w.f = fopen("/dev/full", "wb");
+    CHECK(w.f != NULL);
+    if (!w.f) {
+        return;
+    }
+    CHECK(fputs("pending", w.f) >= 0);
+    CHECK(lsc_writer_close(&w) == -1);
+    CHECK(w.f == NULL);
+
+    /* fflush may later succeed, but a previous ferror remains a failure. */
+    w.f = fopen("/dev/full", "wb");
+    CHECK(w.f != NULL);
+    if (!w.f) {
+        return;
+    }
+    CHECK(setvbuf(w.f, NULL, _IONBF, 0) == 0);
+    CHECK(fputc('x', w.f) == EOF);
+    CHECK(ferror(w.f));
+    CHECK(lsc_writer_flush(&w) == -1);
+    CHECK(lsc_writer_sync(&w) == -1);
+    CHECK(lsc_writer_close(&w) == -1);
+    CHECK(w.f == NULL);
+
+    /* Even a late fclose failure must clear the stream handle. */
+    w.f = tmpfile();
+    CHECK(w.f != NULL);
+    if (!w.f) {
+        return;
+    }
+    CHECK(close(fileno(w.f)) == 0);
+    CHECK(lsc_writer_close(&w) == -1);
+    CHECK(w.f == NULL);
+}
+
 int main(void)
 {
     snprintf(g_path, sizeof(g_path), "/tmp/test-canlog-XXXXXX");
@@ -258,6 +294,7 @@ int main(void)
     test_rejects_bad_header();
     test_reader_snapshot();
     test_header_extensions();
+    test_writer_errors();
 
     unlink(g_path);
     unlink(g_out);

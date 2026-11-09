@@ -14,7 +14,8 @@ Examples:
 
 import argparse
 import csv
-import os
+import json
+import math
 import signal
 import socket
 import struct
@@ -30,7 +31,7 @@ TICK_S = 0.001
 
 
 def build_frame(idx, can_id):
-    data = idx.to_bytes(4, "little") + PATTERN
+    data = (idx & 0xFFFFFFFF).to_bytes(4, "little") + PATTERN
     return CAN_FRAME.pack(can_id, 8, data)
 
 
@@ -87,7 +88,7 @@ def tx(args):
             consec = 0
             if rec:
                 rec.write(f"{sent},{time.monotonic_ns()},{args.id:X},"
-                          f"{int(args.ext)},8,{sent.to_bytes(4, 'little').hex()}"
+                          f"{int(args.ext)},8,{(sent & 0xFFFFFFFF).to_bytes(4, 'little').hex()}"
                           f"{PATTERN.hex()}\n")
             sent += 1
             if time.monotonic() >= next_report:
@@ -102,41 +103,61 @@ def tx(args):
     elapsed = time.monotonic() - start
     print(f"done: sent={sent} in {elapsed:.1f}s actual={sent / elapsed:.1f} fps "
           f"errors={errors}", flush=True)
-    return 0 if errors == 0 else 1
+    result = {"sent": sent, "errors": errors, "completed": total is None or sent == total}
+    print("result: " + json.dumps(result, separators=(",", ":")), flush=True)
+    return 0 if errors == 0 and result["completed"] else 1
+
+
+def verify_file(path, can_id, *, ext=False, first=0, expect=None, allow_empty=False):
+    """Stream and strictly validate one part; return total and matched counts."""
+    records = matched = 0
+    want = first & 0xFFFFFFFF
+    expected_flags = 1 if ext else 0
+    with open(path, "rb") as f:
+        header = f.read(LSC_HEADER)
+        if len(header) != LSC_HEADER or header[:4] != b"LSC1":
+            raise ValueError("short or invalid .lsc header")
+        if struct.unpack_from("<H", header, 4)[0] != 1:
+            raise ValueError("unsupported .lsc version")
+        flags = struct.unpack_from("<I", header, 10)[0]
+        if flags & 2 and struct.unpack_from("<I", header, 28)[0] > 999:
+            raise ValueError("invalid millisecond anchor")
+        while True:
+            raw = f.read(LSC_REC.size)
+            if not raw:
+                break
+            if len(raw) != LSC_REC.size:
+                raise ValueError(f"truncated tail at record {records}")
+            _, _, ident, frame_flags, dlc, data = LSC_REC.unpack(raw)
+            index = records
+            records += 1
+            if frame_flags & ~7 or dlc > 8 or ident > (0x1FFFFFFF if frame_flags & 1 else 0x7FF):
+                raise ValueError(f"invalid frame at record {index}")
+            if can_id is not None and ident != can_id:
+                continue
+            if frame_flags != expected_flags or dlc != 8 or data[4:] != PATTERN:
+                raise ValueError(f"wrong flags/DLC/pattern at record {index}")
+            got = int.from_bytes(data[:4], "little")
+            if got != want:
+                raise ValueError(f"record {index} counter={got} expected={want}")
+            matched += 1
+            want = (want + 1) & 0xFFFFFFFF
+    if matched == 0 and expect != 0 and not allow_empty:
+        raise ValueError(f"no matching frames in {records} records")
+    if expect is not None and matched != expect:
+        raise ValueError(f"matched={matched} expected={expect} (records={records})")
+    return {"records": records, "matched": matched, "next": want}
 
 
 def verify(args):
-    with open(args.verify, "rb") as f:
-        blob = f.read()
-    if blob[:4] != b"LSC1":
-        print(f"FAIL: bad magic {blob[:4]!r}", file=sys.stderr)
+    try:
+        result = verify_file(args.verify, args.id, ext=args.ext, first=args.first,
+                             expect=args.expect)
+    except (OSError, ValueError) as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
         return 1
-    n = (len(blob) - LSC_HEADER) // LSC_REC.size
-    if args.expect is not None and n != args.expect:
-        print(f"FAIL: records={n} expected={args.expect}", file=sys.stderr)
-        return 1
-    want = args.first
-    bad = 0
-    for i in range(n):
-        seq, ts, ident, flags, dlc, data = LSC_REC.unpack_from(
-            blob, LSC_HEADER + i * LSC_REC.size)
-        if args.id is not None and ident != args.id:
-            continue
-        if dlc != 8:
-            print(f"FAIL: record {i} dlc={dlc}", file=sys.stderr)
-            return 1
-        got = int.from_bytes(data[:4], "little")
-        if got != want:
-            if bad < 10:
-                print(f"FAIL: record {i} counter={got} expected={want}",
-                      file=sys.stderr)
-            bad += 1
-        want = got + 1
-    if bad:
-        print(f"FAIL: {bad} counter mismatches in {n} records", file=sys.stderr)
-        return 1
-    print(f"verify: {n} records, counters {args.first}..{want - 1}, "
-          f"no gaps/duplicates")
+    print(f"verify: {result['records']} records, {result['matched']} matched, "
+          f"next counter {result['next']}, no gaps/duplicates")
     return 0
 
 
@@ -147,15 +168,21 @@ def main():
     p.add_argument("--rate", type=float, default=1000.0, help="frames per second")
     p.add_argument("--duration", type=float, default=10.0, help="seconds; 0 = until Ctrl-C")
     p.add_argument("--id", type=lambda v: int(v, 0), default=0x123)
-    p.add_argument("--ext", action="store_true", help="send extended IDs")
+    p.add_argument("--ext", action="store_true", help="send/verify extended IDs")
     p.add_argument("--record", help="write accepted sends as CSV")
     p.add_argument("--verify", metavar="LSC", help="verify a captured .lsc instead")
-    p.add_argument("--expect", type=int, help="expected record count for --verify")
+    p.add_argument("--expect", type=int, help="expected matching frame count for --verify")
     p.add_argument("--first", type=int, default=0,
                    help="first counter value for --verify (default 0)")
     args = p.parse_args()
-    if args.rate <= 0:
-        p.error("--rate must be > 0")
+    if not math.isfinite(args.rate) or args.rate <= 0:
+        p.error("--rate must be finite and > 0")
+    if not math.isfinite(args.duration) or args.duration < 0:
+        p.error("--duration must be finite and >= 0")
+    if not 0 <= args.id <= (0x1FFFFFFF if args.ext else 0x7FF):
+        p.error("--id out of range for frame kind")
+    if args.first < 0 or (args.expect is not None and args.expect < 0):
+        p.error("--first and --expect must be >= 0")
     return verify(args) if args.verify else tx(args)
 
 

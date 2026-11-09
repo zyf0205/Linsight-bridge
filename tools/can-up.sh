@@ -15,7 +15,7 @@
 # Notes:
 # - `usbipd attach --wsl` needs an *elevated* Windows terminal unless the
 #   busid was bound once with `usbipd bind` (then attach works per-user).
-#   This script calls usbipd via cmd.exe; if it fails, run the one-liner
+#   This script calls usbipd.exe directly; if it fails, run the one-liner
 #   from an admin PowerShell and re-run this script with --status.
 # - modprobe/ip use sudo (password prompt). can-down.sh tears it all down.
 

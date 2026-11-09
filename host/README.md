@@ -15,7 +15,7 @@ device ──Wi-Fi/TCP── linsightd ── .lsc writer thread
 ```bash
 cd host
 cmake -S . -B build && cmake --build build -j"$(nproc)"
-ctest --test-dir build --output-on-failure        # 12 tests
+ctest --test-dir build --output-on-failure        # 14 tests
 cmake -S . -B build-asan -DLINSIGHT_SANITIZE=ON   # ASan/UBSan
 ```
 
@@ -38,9 +38,10 @@ daemon after editing `web/index.html`. `--http-port 0` disables the dashboard.
 `--http-bind 0.0.0.0` exposes it on the LAN (no authentication — isolated bench
 only). `--log-max-mb N` rotates each session into `-pNNN` parts; `0` keeps one
 file per session. `--log-max-total-mb N` deletes the oldest `can-*.lsc` files at
-startup and after a session closes (default `0` = keep all). A transient write
-error closes the bad part and retries a fresh one after 2 s instead of dropping
-the rest of the session.
+startup, after rotation/session close, and at most once per second during
+writes (default `0` = keep all); the current part is protected. A transient write
+or flush error closes the bad part and retries a fresh one after 2 s;
+initial open failures also retry within the same session.
 
 ## CLI
 
@@ -60,7 +61,8 @@ build/linsight-cli verify rec00001.lsc [--strict]
 
 Global options: `--ctl PATH`, `--ctl-port PORT`, `--version`. The control socket
 is resolved from `--ctl`, then `$LINSIGHT_CTL`, then `/run/linsight/ctl.sock` if
-it exists, then `/tmp/linsight.sock`. Control commands use a 5 s receive timeout;
+it exists, then `/tmp/linsight.sock`. Request/reply commands use a 5 s receive
+timeout; `live` subscriptions stay open while idle.
 `config` exits 0 on ACK OK, 2 on `BAD_ARG`, 3 on `FAILED`, 4 when the daemon
 reports an ACK timeout. `compare` exits 1 when missing/extra/order counts are
 non-zero. `decode` supports Intel/Motorola signals with signedness, factor and

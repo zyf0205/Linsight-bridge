@@ -276,15 +276,23 @@ static int log_filter(const struct dirent *e)
            strcmp(e->d_name + n - 4, ".lsc") == 0;
 }
 
-/* Delete the oldest can-*.lsc files until the directory is under the cap.
- * Names sort by their timestamp prefix, so alphasort is oldest-first. */
+static int log_order(const struct dirent **a, const struct dirent **b)
+{
+    /* The original file must sort before its -pNNN parts. */
+    const size_t an = strlen((*a)->d_name) - 4;
+    const size_t bn = strlen((*b)->d_name) - 4;
+    const int cmp = strncmp((*a)->d_name, (*b)->d_name, an < bn ? an : bn);
+    return cmp ? cmp : (an > bn) - (an < bn);
+}
+
+/* Delete the oldest can-*.lsc files until the directory is under the cap. */
 static void log_retention(void)
 {
     if (g_log_max_total_bytes == 0) {
         return;
     }
     struct dirent **list = NULL;
-    const int n = scandir(g_log_dir, &list, log_filter, alphasort);
+    const int n = scandir(g_log_dir, &list, log_filter, log_order);
     if (n <= 0) {
         return;
     }
@@ -325,6 +333,21 @@ static void log_retention(void)
     free(list);
 }
 
+/* Buffered fwrite success is provisional until the stream flushes. */
+static int writer_commit(lsc_writer_t *w, bool close, uint32_t *pending, uint32_t *ok)
+{
+    const int rc = close ? lsc_writer_close(w) : lsc_writer_flush(w);
+    if (rc == 0) {
+        *ok += *pending;
+    } else {
+        fprintf(stderr, TAG ": log %s failed: %s\n", close ? "close" : "flush",
+                strerror(errno));
+        wring_set_log_error(close ? "close failed" : "flush failed");
+    }
+    *pending = 0;
+    return rc;
+}
+
 static void *writer_thread(void *arg)
 {
     (void)arg;
@@ -337,6 +360,7 @@ static void *writer_thread(void *arg)
     uint32_t log_part = 0;
     char reopen_path[560] = {0};
     uint64_t reopen_after_ms = 0;
+    uint64_t retention_after_ms = 0;
 
     log_retention();
 
@@ -362,6 +386,7 @@ static void *writer_thread(void *arg)
         pthread_mutex_unlock(&g_ring.lock);
 
         uint32_t ok = 0;
+        uint32_t pending = 0;
         for (uint32_t i = 0; i < n; i++) {
             const wring_entry_t *e = &batch[i];
 
@@ -379,15 +404,15 @@ static void *writer_thread(void *arg)
                     wring_set_current_log(reopen_path);
                     wring_set_log_error("");
                     reopen_path[0] = '\0';
+                    log_retention();
                 } else {
                     reopen_after_ms = mono_ms() + 2000u;
                 }
             }
 
             if (log_open && e->gen != log_gen) {
-                /* Generation boundary: every record of the old session has
-                 * been written, so it is safe to close its file now. */
-                lsc_writer_close(&w);
+                /* Commit the old generation before opening the new session. */
+                writer_commit(&w, true, &pending, &ok);
                 log_open = false;
                 wring_take_close(log_gen);
             }
@@ -407,21 +432,25 @@ static void *writer_thread(void *arg)
                         .flags = LSC_FLAG_ANCHOR_MS_VALID | LSC_FLAG_BOOT_VALID,
                         .boot_count = boot_count,
                     };
+                    snprintf(base_path, sizeof(base_path), "%s", path);
+                    log_start_wall_ms = start_wall_ms;
+                    log_boot = boot_count;
+                    log_part = 0;
+                    reopen_path[0] = '\0';
+                    reopen_after_ms = 0;
                     log_open = lsc_writer_open_ex(&w, path, wring_bitrate(), &info) == 0;
                     log_gen = e->gen;
                     wring_clear_close_before(log_gen);
                     if (log_open) {
-                        snprintf(base_path, sizeof(base_path), "%s", path);
-                        log_start_wall_ms = start_wall_ms;
-                        log_boot = boot_count;
-                        log_part = 0;
-                        reopen_path[0] = '\0';
-                        reopen_after_ms = 0;
                         wring_set_current_log(base_path);
                         wring_set_log_error("");
+                        log_retention();
                     } else {
                         wring_set_log_error("open failed");
                         fprintf(stderr, TAG ": cannot open %s: %s\n", path, strerror(errno));
+                        log_part++;
+                        log_part_path(base_path, log_part, reopen_path, sizeof(reopen_path));
+                        reopen_after_ms = mono_ms() + 2000u;
                     }
                 }
                 if (!log_open) {
@@ -438,7 +467,7 @@ static void *writer_thread(void *arg)
                 (uint64_t)LSC_HEADER_SIZE + (w.written + 1) * LINSIGHT_REC_SIZE >
                     g_log_max_bytes) {
                 char next[560];
-                lsc_writer_close(&w);
+                writer_commit(&w, true, &pending, &ok);
                 log_part++;
                 log_part_path(base_path, log_part, next, sizeof(next));
                 const lsc_open_info_t info = {
@@ -450,11 +479,15 @@ static void *writer_thread(void *arg)
                 if (log_open) {
                     wring_set_current_log(next);
                     wring_set_log_error("");
+                    log_retention();
                     fprintf(stderr, TAG ": log rotated to %s\n", next);
                 } else {
                     wring_set_log_error("rotate failed");
                     fprintf(stderr, TAG ": cannot rotate log to %s: %s\n", next,
                             strerror(errno));
+                    snprintf(reopen_path, sizeof(reopen_path), "%s", next);
+                    reopen_after_ms = mono_ms() + 2000u;
+                    continue;
                 }
             }
 
@@ -464,6 +497,7 @@ static void *writer_thread(void *arg)
                 /* Close the bad stream and try a fresh part in 2 s; one
                  * transient error must not discard the rest of the session. */
                 lsc_writer_close(&w);
+                pending = 0;
                 log_open = false;
                 if (base_path[0]) {
                     log_part++;
@@ -472,13 +506,20 @@ static void *writer_thread(void *arg)
                 reopen_after_ms = mono_ms() + 2000u;
                 continue; /* this record is counted as dropped */
             }
-            ok++;
+            pending++;
+        }
+
+        if (log_open && pending > 0 && writer_commit(&w, false, &pending, &ok) != 0) {
+            lsc_writer_close(&w);
+            log_open = false;
+            log_part++;
+            log_part_path(base_path, log_part, reopen_path, sizeof(reopen_path));
+            reopen_after_ms = mono_ms() + 2000u;
         }
 
         if (ok < n) {
-            /* Includes log-open failures, stale generations and write errors:
-             * `dropped` is the total number of records that never reached a
-             * .lsc file, not just ring overflow. */
+            /* Failed batches are conservatively counted as dropped: a partial
+             * disk write cannot prove which records reached the file. */
             pthread_mutex_lock(&g_ring.lock);
             g_ring.dropped += n - ok;
             pthread_mutex_unlock(&g_ring.lock);
@@ -489,12 +530,17 @@ static void *writer_thread(void *arg)
             pthread_mutex_unlock(&g_ring.lock);
         }
 
+        if (g_log_max_total_bytes && ok > 0 && mono_ms() >= retention_after_ms) {
+            log_retention();
+            retention_after_ms = mono_ms() + 1000u;
+        }
+
         /* The queue is drained (n < LOG_BATCH means it was fully popped).
          * Close a dead session; a close with no open log belongs to a session
          * that never produced a record, so there is no file to close. */
         if (n < LOG_BATCH) {
             if (log_open && wring_take_close(log_gen)) {
-                lsc_writer_close(&w);
+                writer_commit(&w, true, &pending, &ok);
                 log_open = false;
                 log_retention();
             }
@@ -507,10 +553,6 @@ static void *writer_thread(void *arg)
             }
         }
 
-        if (n > 0 && log_open) {
-            lsc_writer_flush(&w);
-        }
-
         if (finish) {
             pthread_mutex_lock(&g_ring.lock);
             /* A pending open without records has no file and needs no work. */
@@ -518,7 +560,7 @@ static void *writer_thread(void *arg)
             pthread_mutex_unlock(&g_ring.lock);
             if (empty) {
                 if (log_open) {
-                    lsc_writer_close(&w);
+                    writer_commit(&w, true, &pending, &ok);
                 }
                 break;
             }

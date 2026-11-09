@@ -1,12 +1,8 @@
 #include "can_ring.h"
 
-#include <string.h>
-
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-
-#define TAG "can_ring"
 
 static linsight_can_record_t *s_buf;
 static uint32_t s_cap;
@@ -87,7 +83,6 @@ void can_ring_get_info(can_ring_info_t *out)
     out->used = s_count;
     out->cap = s_cap;
     out->dropped = s_dropped;
-    out->stored = s_stored;
     xSemaphoreGive(s_lock);
 }
 

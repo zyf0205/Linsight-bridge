@@ -27,7 +27,6 @@ typedef struct {
     uint32_t used;     /* records currently stored */
     uint32_t cap;      /* total capacity */
     uint32_t dropped;  /* records lost to overwrite */
-    uint32_t stored;   /* records stored since boot (seq base) */
 } can_ring_info_t;
 
 /* Allocates capacity_records from PSRAM. Call once from app_main. */
