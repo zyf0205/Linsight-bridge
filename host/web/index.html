@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LinSight · CAN Analyzer</title>
+<title>LinSight · CAN 分析仪</title>
 <style>
 :root{
   --bg:#07080c; --panel:#101218; --panel2:#171a22; --panel3:#1f232e;
@@ -226,109 +226,109 @@ footer{
 <header>
   <div class="brand">
     <span class="mark"><i></i><i></i><i></i></span>
-    <div><h1>LinSight</h1><p>wireless CAN analyzer</p></div>
+    <div><h1>LinSight</h1><p>无线 CAN 分析仪</p></div>
   </div>
   <div class="headstatus">
-    <span class="pill" id="busPill">STOPPED</span>
-    <span class="chip"><span>Bitrate</span><b class="kv" id="br">—</b></span>
-    <span class="chip"><span>Mode</span><b class="kv" id="mode">—</b></span>
-    <span class="link"><span class="dot" id="linkDot"></span><span id="linkText">CONNECTING</span></span>
+    <span class="pill" id="busPill">已停止</span>
+    <span class="chip"><span>波特率</span><b class="kv" id="br">—</b></span>
+    <span class="chip"><span>模式</span><b class="kv" id="mode">—</b></span>
+    <span class="link"><span class="dot" id="linkDot"></span><span id="linkText">连接中</span></span>
   </div>
 </header>
 
 <main>
   <section class="tiles">
     <div class="tile">
-      <div class="tile-top"><label>Frames / s</label><small id="fpsPeak">peak 0</small></div>
-      <b id="fps">—</b><small id="uptime">uptime —</small>
+      <div class="tile-top"><label>帧 / 秒</label><small id="fpsPeak">峰值 0</small></div>
+      <b id="fps">—</b><small id="uptime">运行 —</small>
     </div>
     <div class="tile">
-      <div class="tile-top"><label>Bus load</label><small>estimated</small></div>
+      <div class="tile-top"><label>总线负载</label><small>估算</small></div>
       <b id="load">—</b><div class="meter"><i id="loadBar"></i></div>
     </div>
     <div class="tile">
-      <div class="tile-top"><label>TEC / REC</label><small>error counters</small></div>
+      <div class="tile-top"><label>TEC / REC</label><small>错误计数器</small></div>
       <b id="err">—</b><div class="meter"><i id="errBar"></i></div>
     </div>
     <div class="tile">
-      <div class="tile-top"><label>Overflow</label><small>drops</small></div>
-      <b id="ovf">—</b><small>capture + log drops</small>
+      <div class="tile-top"><label>溢出</label><small>丢帧</small></div>
+      <b id="ovf">—</b><small>采集 + 记录丢帧</small>
     </div>
     <div class="tile">
-      <div class="tile-top"><label>Frames</label><small>total</small></div>
-      <b id="total">—</b><small id="recsub">logged —</small>
+      <div class="tile-top"><label>总帧数</label><small>累计</small></div>
+      <b id="total">—</b><small id="recsub">已记录 —</small>
     </div>
     <div class="tile">
-      <div class="tile-top"><label>Ring</label><small id="ringsub">cap —</small></div>
+      <div class="tile-top"><label>环形缓冲</label><small id="ringsub">容量 —</small></div>
       <b id="ring">—</b><div class="meter"><i id="ringBar"></i></div>
     </div>
   </section>
 
   <section class="controls card">
     <div class="ctlgroup">
-      <label for="bitrate">Bitrate</label>
+      <label for="bitrate">波特率</label>
       <select id="bitrate">
         <option value="125000">125K</option>
         <option value="250000">250K</option>
         <option value="500000" selected>500K</option>
         <option value="1000000">1M</option>
       </select>
-      <button class="btn" id="applyBr">Set</button>
+      <button class="btn" id="applyBr">设置</button>
     </div>
     <span class="sep"></span>
-    <button class="btn" id="modeBtn">Mode</button>
-    <button class="btn" id="pauseBtn">Pause</button>
-    <button class="btn danger" id="clearBtn">Clear</button>
+    <button class="btn" id="modeBtn">模式</button>
+    <button class="btn" id="pauseBtn">暂停</button>
+    <button class="btn danger" id="clearBtn">清除</button>
     <div class="spacer"></div>
     <div class="seg" id="typeSeg">
-      <button class="active" data-t="ALL">ALL</button>
+      <button class="active" data-t="ALL">全部</button>
       <button data-t="STD">STD</button>
       <button data-t="EXT">EXT</button>
       <button data-t="RTR">RTR</button>
       <button data-t="ERR">ERR</button>
     </div>
-    <input id="filter" placeholder="Filter ID (hex)  [/]" spellcheck="false" autocomplete="off">
-    <button class="btn" id="freezeBtn" title="Shortcut: Space">Freeze</button>
-    <button class="btn" id="csvBtn">Export CSV</button>
+    <input id="filter" placeholder="过滤 ID（十六进制）  [/]" spellcheck="false" autocomplete="off">
+    <button class="btn" id="freezeBtn" title="快捷键：空格">冻结</button>
+    <button class="btn" id="csvBtn">导出 CSV</button>
   </section>
 
   <section class="layout">
     <div class="card trace">
       <div class="cardhead">
         <div class="ctlgroup">
-          <h2>Live frames</h2>
+          <h2>实时帧</h2>
           <div class="seg" id="viewSeg">
-            <button class="active" data-v="stream">Stream</button>
-            <button data-v="monitor" title="Group by ID & highlight byte changes">Monitor</button>
+            <button class="active" data-v="stream">流式</button>
+            <button data-v="monitor" title="按 ID 分组并高亮字节变化">监视</button>
           </div>
         </div>
-        <span class="dim mono" id="streamState" style="font-size:11px">connecting…</span>
+        <span class="dim mono" id="streamState" style="font-size:11px">连接中…</span>
       </div>
       <div class="tablewrap">
         <table>
           <thead>
-            <tr><th>Time</th><th>Δt (ms)</th><th>ID</th><th>Type</th><th>DLC</th><th>Data (Hex)</th><th>ASCII</th><th class="r">Count</th></tr>
+            <tr><th>时间</th><th>Δt (ms)</th><th>ID</th><th>类型</th><th>DLC</th><th>数据 (Hex)</th><th>ASCII</th><th class="r">计数</th></tr>
           </thead>
-          <tbody id="rows"><tr><td colspan="8" class="empty">Waiting for CAN frames…</td></tr></tbody>
+          <tbody id="rows"><tr><td colspan="8" class="empty">等待 CAN 帧…</td></tr></tbody>
         </table>
       </div>
       <div class="inspector">
-        <span id="inspText" class="dim">Click any frame row to inspect binary bits &amp; integer values</span>
+        <span id="inspText" class="dim">点击任意帧行查看二进制位与整数值</span>
         <div class="insp-bits" id="inspBits"></div>
       </div>
     </div>
 
     <aside>
       <div class="card chart">
-        <div class="cardhead"><h2>Frames / second</h2><b id="fpsNow" class="blue">0</b></div>
+        <div class="cardhead"><h2>每秒帧数</h2><b id="fpsNow" class="blue">0</b></div>
         <canvas id="fpsChart"></canvas>
       </div>
       <div class="card chart">
-        <div class="cardhead"><h2>Bus load</h2><b id="loadNow" style="color:var(--orange)">0%</b></div>
+        <div class="cardhead"><h2>总线负载</h2><b id="loadNow" style="color:var(--orange)">0%</b></div>
         <canvas id="loadChart"></canvas>
       </div>
       <div class="card ids">
-        <div class="cardhead"><h2>Top IDs (click to filter)</h2><span class="dim mono" id="idTotal" style="font-size:10px">0 IDs</span></div>
+        <div class="cardhead"><h2>高频 ID（点击过滤）</h2><span class="dim mono" id="idTotal" style="font-size:10px">0 个 ID</span></div>
         <div class="idlist" id="idlist"><div class="empty">—</div></div>
       </div>
     </aside>
@@ -336,7 +336,7 @@ footer{
 </main>
 
 <div class="toast" id="toast"></div>
-<footer><span>linsightd · HTTP + SSE · single epoll loop</span><span id="logPath"></span></footer>
+<footer><span>linsightd · HTTP + SSE · 单 epoll 事件循环</span><span id="logPath"></span></footer>
 
 <script>
 (() => {
@@ -458,7 +458,7 @@ footer{
     const body = $("rows");
     if (!rows.length) {
       body.innerHTML = `<tr><td colspan="8" class="empty">${
-        state.frozen ? "Display frozen (press Space to unfreeze)" : "Waiting for CAN frames…"
+        state.frozen ? "显示已冻结（按空格键恢复）" : "等待 CAN 帧…"
       }</td></tr>`;
       return;
     }
@@ -506,7 +506,7 @@ footer{
   }
 
   function renderIds() {
-    $("idTotal").textContent = `${state.counts.size} IDs`;
+    $("idTotal").textContent = `${state.counts.size} 个 ID`;
     const all = [...state.counts.values()];
     const totalN = all.reduce((s, x) => s + x.n, 0) || 1;
     const top = all.sort((a, b) => b.n - a.n).slice(0, 8);
@@ -581,7 +581,7 @@ footer{
     samples.push({ fps, load });
     if (samples.length > MAX_SAMPLES) samples.shift();
     $("fpsNow").textContent = fmt(fps);
-    $("fpsPeak").textContent = "peak " + fmt(state.peakFps);
+    $("fpsPeak").textContent = "峰值 " + fmt(state.peakFps);
     $("loadNow").textContent = load.toFixed(0) + "%";
     drawSpark($("fpsChart"), samples.map((x) => x.fps), "#0a84ff", Math.max(500, ...samples.map((x) => x.fps)));
     drawSpark($("loadChart"), samples.map((x) => x.load), "#ff9f0a", 100);
@@ -589,10 +589,10 @@ footer{
 
   function setLink() {
     const dot = $("linkDot"), text = $("linkText");
-    if (!state.sse) { dot.className = "dot bad"; text.textContent = "STREAM LOST"; }
-    else if (!state.device) { dot.className = "dot warn"; text.textContent = "NO DEVICE"; }
-    else { dot.className = "dot ok"; text.textContent = "DEVICE OK"; }
-    $("streamState").textContent = state.sse ? "SSE live" : "reconnecting…";
+    if (!state.sse) { dot.className = "dot bad"; text.textContent = "数据流中断"; }
+    else if (!state.device) { dot.className = "dot warn"; text.textContent = "未连接设备"; }
+    else { dot.className = "dot ok"; text.textContent = "设备在线"; }
+    $("streamState").textContent = state.sse ? "SSE 实时" : "重连中…";
   }
 
   function apply(j) {
@@ -615,28 +615,28 @@ footer{
 
     $("ovf").textContent = fmt((Number(s.dropped) || 0) + (Number(j.dropped) || 0));
     $("total").textContent = fmt(j.records || 0);
-    $("recsub").textContent = "logged " + fmt(j.written || 0);
+    $("recsub").textContent = "已记录 " + fmt(j.written || 0);
     $("ring").textContent = fmt(ringUsed);
-    $("ringsub").textContent = "cap " + fmt(s.ring_cap || 0);
+    $("ringsub").textContent = "容量 " + fmt(s.ring_cap || 0);
     $("ringBar").style.width = Math.min(100, (ringUsed / ringCap) * 100) + "%";
 
     $("br").textContent = brName(br);
-    $("mode").textContent = (s.mode || "—") + (s.paused ? " · PAUSED" : "");
-    $("pauseBtn").textContent = s.paused ? "Resume" : "Pause";
+    $("mode").textContent = (s.mode || "—") + (s.paused ? " · 已暂停" : "");
+    $("pauseBtn").textContent = s.paused ? "恢复" : "暂停";
 
     const pill = $("busPill");
     const st = String(s.state || "");
     if (st === "BUS_OFF") { pill.textContent = "BUS-OFF"; pill.className = "pill bad"; }
-    else if (st === "RUNNING" && (tec >= 128 || rec >= 128)) { pill.textContent = "PASSIVE"; pill.className = "pill warn"; }
-    else if (st === "RUNNING") { pill.textContent = "ACTIVE"; pill.className = "pill ok"; }
-    else if (st === "RECOVERING") { pill.textContent = "RECOVERING"; pill.className = "pill warn"; }
-    else { pill.textContent = st || "STOPPED"; pill.className = "pill"; }
+    else if (st === "RUNNING" && (tec >= 128 || rec >= 128)) { pill.textContent = "被动"; pill.className = "pill warn"; }
+    else if (st === "RUNNING") { pill.textContent = "主动"; pill.className = "pill ok"; }
+    else if (st === "RECOVERING") { pill.textContent = "恢复中"; pill.className = "pill warn"; }
+    else { pill.textContent = st || "已停止"; pill.className = "pill"; }
 
     const up = Math.floor((Number(s.uptime_ms) || 0) / 1000);
     const hh = String(Math.floor(up / 3600)).padStart(2, "0");
     const mm = String(Math.floor((up % 3600) / 60)).padStart(2, "0");
     const ss = String(up % 60).padStart(2, "0");
-    $("uptime").textContent = `uptime ${hh}:${mm}:${ss}`;
+    $("uptime").textContent = `运行 ${hh}:${mm}:${ss}`;
     $("logPath").textContent = j.log || "";
 
     if (document.activeElement !== $("bitrate") && br) $("bitrate").value = String(br);
@@ -663,11 +663,13 @@ footer{
       const j = await r.json();
       if (j.ok) {
         if (cmd === "clear") { state.rows = []; state.counts.clear(); state.peakFps = 0; render(); }
-        toast(cmd.toUpperCase() + "  →  OK");
+        const label = cmd === "pause" ? "暂停" : cmd === "resume" ? "恢复"
+          : cmd === "clear" ? "清除" : "配置";
+        toast(label + "指令已发送");
         $("applyBr").classList.remove("active");
-      } else toast(j.error || "rejected", false);
+      } else toast(j.error || "设备拒绝", false);
     } catch {
-      toast("control link failed", false);
+      toast("控制链路失败", false);
     }
   }
 
@@ -681,7 +683,7 @@ footer{
 
   const toggleFreeze = () => {
     state.frozen = !state.frozen;
-    $("freezeBtn").textContent = state.frozen ? "Unfreeze" : "Freeze";
+    $("freezeBtn").textContent = state.frozen ? "解冻" : "冻结";
     $("freezeBtn").classList.toggle("active", state.frozen);
     render();
   };
@@ -720,14 +722,14 @@ footer{
   };
 
   $("csvBtn").onclick = () => {
-    if (!state.rows.length) return toast("No frames to export", false);
+    if (!state.rows.length) return toast("没有可导出的帧", false);
     const lines = ["time_ms,id_hex,type,dlc,data_hex"];
     for (const f of state.rows) lines.push(`${f.t},${hexId(f)},${typeOf(f)},${f.d},${f.b || ""}`);
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
     a.download = `linsight-${Date.now()}.csv`;
     a.click();
-    toast(`Exported ${state.rows.length} frames`);
+    toast(`已导出 ${state.rows.length} 帧`);
   };
 
   window.addEventListener("keydown", (e) => {
