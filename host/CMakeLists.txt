@@ -19,7 +19,6 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../protocol)
 add_executable(linsightd
     src/main.c
     src/canlog.c
-    src/http.c
     src/session.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
 target_link_libraries(linsightd pthread rt)
@@ -91,10 +90,9 @@ if(Python3_FOUND)
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tools.py)
 endif()
 
-# Install: binaries, single-file dashboard, systemd unit + /etc/default args.
+# Install: binaries, systemd unit + /etc/default args.
 include(GNUInstallDirs)
 install(TARGETS linsightd linsight-cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES web/index.html DESTINATION ${CMAKE_INSTALL_DATADIR}/linsight/web)
 configure_file(systemd/linsightd.service.in
                ${CMAKE_CURRENT_BINARY_DIR}/linsightd.service @ONLY)
 configure_file(systemd/linsightd.default.in

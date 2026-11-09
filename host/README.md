@@ -1,13 +1,13 @@
 # LinSight host
 
 Linux side of LinSight, a wireless CAN analyzer: `linsightd` (epoll daemon,
-binary logging, HTTP/SSE dashboard) and `linsight-cli`. The ESP32-S3 firmware
-lives in a separate checkout and speaks protocol v2.1 from `protocol/`.
+binary logging, optional SocketCAN forward) and `linsight-cli`. The ESP32-S3
+firmware lives in a separate checkout and speaks protocol v2.1 from `protocol/`.
 
 ```text
 device ──Wi-Fi/TCP── linsightd ── .lsc writer thread
                        ├─ Unix socket / TCP :8889 → linsight-cli
-                       └─ HTTP + SSE :8080     → browser dashboard
+                       └─ --vcan IFACE          → vcan0 → ROS 2 / local consumers
 ```
 
 ## Build and test
@@ -23,25 +23,26 @@ Tests cover the shared parser (including fuzz), record layout, the firmware ring
 drop-oldest policy, `.lsc` reader snapshots, HELLO anchoring/dedupe, candump/ASC
 export shape, SD-style import/verify, `compare`, and two
 end-to-end daemon tests:
-device→CLI/log/HTTP and size-based log rotation.
+device→CLI/log and size-based log rotation.
 
 ## Run
 
 ```bash
 build/linsightd --port 8888 --ctl-port 8889 --log-dir ~/can-logs \
-                --log-max-mb 128 --log-max-total-mb 4096 \
-                --http-port 8080 --http-bind 127.0.0.1 --web-dir web
+                --log-max-mb 128 --log-max-total-mb 4096
 ```
 
-Open <http://127.0.0.1:8080/>. The page is loaded once at startup; restart the
-daemon after editing `web/index.html`. `--http-port 0` disables the dashboard.
-`--http-bind 0.0.0.0` exposes it on the LAN (no authentication — isolated bench
-only). `--log-max-mb N` rotates each session into `-pNNN` parts; `0` keeps one
-file per session. `--log-max-total-mb N` deletes the oldest `can-*.lsc` files at
-startup, after rotation/session close, and at most once per second during
-writes (default `0` = keep all); the current part is protected. A transient write
-or flush error closes the bad part and retries a fresh one after 2 s;
-initial open failures also retry within the same session.
+`--log-max-mb N` rotates each session into `-pNNN` parts; `0` keeps one file per
+session. `--log-max-total-mb N` deletes the oldest `can-*.lsc` files at startup,
+after rotation/session close, and at most once per second during writes (default
+`0` = keep all); the current part is protected. A transient write, flush or 1 Hz
+`fdatasync` error closes the bad part and retries a fresh one after 2 s; initial
+open failures also retry within the same session.
+
+Add `--vcan vcan0` to mirror accepted (already de-duplicated) records onto
+SocketCAN for ROS 2 or `candump`. The write is nonblocking; queue pressure
+increments `vcan_dropped` in `linsight-cli stats` instead of stalling CAN
+receive. A raw CAN socket needs `CAP_NET_RAW`.
 
 ## CLI
 
@@ -74,20 +75,17 @@ every matching frame.
 prints a warning. `verify` checks the header, record length, time order and
 sequence gaps; `--strict` makes a truncated tail or any gap a failure.
 
-## HTTP API
+## SocketCAN / ROS 2
 
-| Endpoint | Behaviour |
-|---|---|
-| `GET /api/stats` | daemon + latest device STATS as one JSON object |
-| `GET /api/live` | SSE stream; each `data:` event is a JSON array of ≤64 records |
-| `GET /api/control?cmd=...` | `pause`, `resume`, `clear`, `config bitrate=500000`, ... |
+`--vcan IFACE` opens `PF_CAN/CAN_RAW` and writes each accepted record as a
+`struct can_frame`; `LINSIGHT_REC_FLAG_EXT`, `_RTR` and `_ERR` map to
+`CAN_EFF_FLAG`, `CAN_RTR_FLAG` and `CAN_ERR_FLAG`. The epoll loop never blocks
+on a full interface queue.
 
-Control is asynchronous: the daemon forwards CONTROL and returns immediately;
-the dashboard reflects the result in the next STATS. Device/CLI replies are
-queued in 4 KiB per-connection buffers drained by EPOLLOUT, so a slow peer can
-never block the epoll loop; a missing device ACK closes the CLI wait after 3 s.
-SSE sends are nonblocking: a slow browser drops event batches instead of
-stalling CAN receive.
+The minimal ROS 2 Humble package in `../ros2_ws/src/linsight_ros2` reads that
+interface and publishes `/can_rx` (`linsight_ros2/msg/CanFrame`) and a 1 Hz
+`/linsight/stats` (`BusStats`). See its `README_ROS2.md` for vcan setup,
+`colcon build`, permissions and verification.
 
 ## Install as a service
 
@@ -98,9 +96,9 @@ sudo systemctl enable --now linsightd
 journalctl -u linsightd -f
 ```
 
-Installs the binaries, `share/linsight/web/index.html`, the systemd unit and
-`/etc/default/linsightd`. The unit uses `DynamicUser`, `StateDirectory` and
-`ProtectSystem=strict`; `.lsc` files live in `/var/lib/linsight` and rotate via
+Installs the binaries, the systemd unit and `/etc/default/linsightd`. The
+unit uses `DynamicUser`, `StateDirectory`, `ProtectSystem=strict` and
+`CAP_NET_RAW` (for optional `--vcan`); `.lsc` files live in `/var/lib/linsight` and rotate via
 `--log-max-mb` (no external logrotate needed for binary logs). With
 `DynamicUser`, the control socket defaults to `/run/linsight/ctl.sock`; the CLI
 checks that path automatically, or pass `--ctl`/`--ctl-port`.

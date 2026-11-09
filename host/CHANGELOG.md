@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Remove the HTTP/SSE dashboard; add optional `--vcan` SocketCAN forwarding for
+  the ROS 2 Humble bridge, a 262144-record writer ring and 1 Hz `fdatasync`.
 - Remove unused log APIs and writer metadata copies; keep the sequential
   reader and filtered exports as the common paths.
 - Keep idle CLI live subscriptions open; report read errors and initialize
@@ -10,8 +12,6 @@
   apply oldest-first retention during active rotation and ongoing writes.
 - Stream and strictly validate soak captures against the generator's actual
   sent count; add CLI, storage-failure and offline tool regressions.
-- Bound dashboard ID eviction without clearing the entire table; reset stale
-  inspector values and release CSV download URLs.
 - One-shot USB-CAN bench bring-up: `tools/can-up.sh` / `tools/can-down.sh`
   wrap `usbipd attach`, `modprobe peak_usb`, bitrate configuration and
   `ip link set can0 up`, with `--status` for diagnostics.

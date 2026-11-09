@@ -12,10 +12,10 @@
 |---|---|---|
 | MCU / RTOS | TWAI 采集、PSRAM ring、双子历史缓冲、Wi-Fi/TCP、任务优先级 | M3.4 / M3.5 |
 | LVGL | 320×240 三视图 UI（总线健康概览 / Raw trace / Settings）、Top-ID 1 s 速率排名、过滤/触发、跨任务邮箱 | M3.1 的 UI 项 |
-| Linux 系统 | epoll/signalfd/timerfd、非阻塞 socket、Unix socket、写线程 + 有界 ring、二进制日志、HTTP/SSE | M4 P0、M5、M6 soak |
+| Linux 系统 | epoll/signalfd/timerfd、非阻塞 socket、Unix socket、写线程 + 有界 ring、二进制日志、SocketCAN 转发、ROS 2 桥接 | M4 P0、M5、M6 soak |
 | 工程化 | 共享纯 C 协议、fuzz、ctest/ASan、台架工具、文档单一事实源 | M3.0、M4 CI |
 
-非目标：CAN FD（S3 不支持）、多通道、多设备集群、云端；Web 仅作可视化层（单文件、无框架/构建）。
+非目标：CAN FD（S3 不支持）、多通道、多设备集群、云端；ROS 2 仅作本机桥接。
 
 ## 2. 仓库与数据流
 
@@ -32,14 +32,14 @@ CAN ── 收发器 ── ESP32-S3
                   ├─ twai_task → PSRAM ring → net_task ─Wi-Fi/TCP→ linsightd → .lsc
                   │            ├→ 捕获侧 512 条 UI history → LVGL 20 Hz
                   │            └→ SD 队列 → recNNNNN.lsc（黑盒，可脱离 PC）
-                  └─ 触摸 / GPIO0        linsightd ─ Unix/TCP → CLI · HTTP/SSE → 浏览器
+                  └─ 触摸 / GPIO0        linsightd ─ Unix/TCP → CLI · --vcan → ROS 2
 ```
 
 ring 4 MiB（约 209k 条）供网络排空，UI history 独立，SD 队列 16k 条；主机追数据时 trace 不会被抽空。
 
 ## 3. 现状与缺陷
 
-M0–M5 已跑通：采集/UI/流式/CONTROL-ACK/daemon/CLI/`.lsc`/导出；上位机 ctest 12/12、
+M0–M5 已跑通：采集/UI/流式/CONTROL-ACK/daemon/CLI/`.lsc`/导出；上位机 ctest 14/14、
 ASan/UBSan 通过。ESP32 自测 30000 帧突发 4330 fps、96% 负载零丢失；M3.1 60 万帧/10.9 min
 （917 fps）计数器连续；M3.4 1 Mbps/60 s 54k 帧零丢、无复位/WDT；M3.5 堆 +1.9 KB。
 
@@ -83,18 +83,19 @@ P1：systemd（`DynamicUser` + journald）、`--log-max-mb` 分卷、DBC 基础�
 `import`/`verify`（mtime 或 `--boot-wall` 重锚定）已实现。物理 PCAN 的 SocketCAN 对照已打通
 （usbipd + `peak_usb` + `can0`，50–917 fps 零丢帧；更高节拍受适配器 ~1 ms/帧限制）。
 
-## 6. M5 CLI 深化与 Web 可视化
+## 6. M5 CLI 深化与 ROS 2 接入
 
 CLI：`live` 过滤/着色、`stats --watch` 周期刷新、`export` 时间与 ID 过滤；全部通过
 Unix socket / `--ctl-port` 复用 daemon。验收：1 h 连续 `live` 不卡；3000 帧/s 可抽样核对。
 
-Web：`src/http.c` 在同一 epoll 循环提供最小 HTTP/1.1 + SSE；`host/web/index.html` 单文件展示
-统计 tile、实时帧表、fps/负载曲线、Top IDs 与控制。SSE 每事件 ≤64 条、非阻塞；`/api/control`
-白名单转发不等 ACK；页面、`/api/stats`、SSE、暂停/恢复由集成测试覆盖。
+SocketCAN：`linsightd --vcan IFACE` 在去重后把记录写成 `struct can_frame` 非阻塞转发到 vcan；
+队列满只增加 `vcan_dropped`。`ros2_ws/src/linsight_ros2` 是最小 Humble 包，读取 vcan0 并发布
+`/can_rx`（`CanFrame`）与 `/linsight/stats`（`BusStats`）。验收：`colcon build` 通过，vcan0
+端到端帧可在 `ros2 topic echo /can_rx` 看到。
 
 ## 7. M6 Soak 与交付
 
-24 h soak：800 fps 约 1.4 GB，本轮不执行，`tools/soak24h.py` 留作可选；交付 `host/README.md`、CHANGELOG、tag v0.3.0。
+24 h soak：800 fps 约 1.4 GB，本轮不执行，`tools/soak24h.py` 留作可选；交付 `host/README.md`、CHANGELOG、tag v0.4.0。
 
 ## 8. 工程约定
 
@@ -104,7 +105,7 @@ Web：`src/http.c` 在同一 epoll 循环提供最小 HTTP/1.1 + SSE；`host/web
   `cd ~/linsight/host && cmake -S . -B build && cmake --build build -j"$(nproc)"`。
 - 本仓库只提交固件；上位机在 `~/linsight` 单独提交；`protocol/`、`docs/` 改动两边同步。
 - 台架用 WSL `can0`（见 [hardware.md](hardware.md) §5）；Python 台架工具留在上位机仓。
-- 台架 Wi-Fi/主机地址集中在 `main/net.c` 的 `BENCH_*` 宏（只重编一个文件，已提交）；生产部署改回 menuconfig/私密配置。Wi-Fi 使用 CN 1–13 信道。
+- 台架 Wi-Fi/主机地址在 `main/Kconfig.projbuild`（默认值即台架热点）；生产构建用 `idf.py menuconfig` 覆盖。Wi-Fi 使用 CN 1–13 信道。
 - 不提交 `build/`、`sdkconfig`、`managed_components/`；文档只放 `docs/`；提交信息用中文。
 
 ## 9. 风险与简历

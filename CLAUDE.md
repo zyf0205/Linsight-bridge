@@ -9,10 +9,9 @@ ctest suite. The ESP32-S3 firmware, Wi-Fi credentials, and flashing live in the 
 Windows checkout `D:\_study\projects\_MyProject\LinSight`; this repo does not build firmware.
 
 Layout:
-- `host/src/` — daemon, `.lsc` writer/reader, replay, compare, DBC, device session, HTTP/SSE
+- `host/src/` — daemon, `.lsc` writer/reader, replay, compare, DBC, device session, SocketCAN forward
 - `host/cli/` — stats/live/config/pause/resume/clear/export/replay/compare/decode
-- `host/web/index.html` — single-file dashboard (served by `linsightd`, no build step)
-- `host/web/CLAUDE.md` — dashboard data contract and constraints
+- `ros2_ws/src/linsight_ros2/` — ROS 2 Humble bridge (vcan → `/can_rx`, `/linsight/stats`)
 - `host/systemd/` — service unit + `/etc/default` args (CMake `install` targets)
 - `host/tests/` — record/parser/fuzz/ring/canlog/compare/dbc/session/export/import/integration/rotation
 - `protocol/` — shared v2.1 parser (mirror of the firmware repo)
@@ -32,7 +31,7 @@ ctest --test-dir build --output-on-failure
 cmake -S . -B build-asan -DLINSIGHT_SANITIZE=ON   # ASan/UBSan build
 
 build/linsightd --port 8888 --ctl-port 8889 --log-dir ~/can-logs \
-                --log-max-mb 128 --http-port 8080 --http-bind 127.0.0.1 --web-dir web
+                --log-max-mb 128 [--vcan vcan0]
 build/linsight-cli stats [--watch] [--interval MS]
 build/linsight-cli live [--id 0x123] [--ext|--std] [--color]
 build/linsight-cli config --bitrate 500000 --mode normal
@@ -43,17 +42,15 @@ build/linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]
 build/linsight-cli compare REF.lsc CAND.lsc
 build/linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]
 
-sudo cmake --install build        # binaries + web + unit + prefix etc/default
+sudo cmake --install build        # binaries + unit + prefix etc/default
 python3 ../tools/can_soak.py --iface can0 --rate 1000 --duration 600 --record /tmp/tx.csv
 python3 ../tools/can_soak.py --verify FILE.lsc --expect 600000
 python3 ../tools/soak24h.py --duration 86400 --rate 800   # report in ~/can-logs/soak-latest
 ```
 
-Dashboard: `http://127.0.0.1:8080/` (Windows browser via WSL localhost forwarding);
-`--http-port 0` disables it, `--http-bind 0.0.0.0` exposes it on the LAN.
-The page is loaded at startup, so restart the daemon after editing `web/index.html`.
-Endpoints: `GET /api/stats` (JSON snapshot), `GET /api/live` (SSE batches),
-`GET /api/control?cmd=pause|resume|clear|config%20bitrate%3D500000` (async CONTROL).
+SocketCAN/ROS 2: `--vcan vcan0` forwards accepted records to SocketCAN; the
+`ros2_ws/src/linsight_ros2` package publishes `/can_rx` and `/linsight/stats`.
+Both `linsightd` and the node need `CAP_NET_RAW` (run with sudo in WSL).
 
 `config` exits 0 on ACK OK, 2 on BAD_ARG, 3 on FAILED. `compare` exits 1 when
 missing/extra/order are non-zero.
@@ -69,16 +66,15 @@ cangen can0 -n 500 -g 20 -I 0x123 -L 8 # 50 fps x 10 s; device total is ground t
 ## Architecture
 
 - `linsightd`: epoll main loop; TCP listener for the device (`INADDR_ANY`), Unix socket
-  `/tmp/linsight.sock` for the CLI, optional loopback `--ctl-port`, optional HTTP
-  dashboard, signalfd, 1 Hz timerfd. Writer thread: bounded 131072-record ring
-  (~3 MiB) -> per-session `can-YYYYMMDD-HHMMSS-NNN.lsc`; close ordered before open.
+  `/tmp/linsight.sock` for the CLI, optional loopback `--ctl-port`, `--vcan` SocketCAN
+  forward, signalfd, 1 Hz timerfd. Writer thread: bounded 262144-record ring (~6 MiB)
+  -> per-session `can-YYYYMMDD-HHMMSS-NNN.lsc`; close ordered before open. A 1 Hz
+  `fdatasync` makes recent batches durable; failures use the same 2 s fresh-part retry.
   `--log-max-mb N` rotates a session into `-pNNN` parts before a record crosses the
   cap; all parts share the session anchor, so timestamps stay continuous.
-- HTTP dashboard (`src/http.c`): same epoll loop, `HTTP_MAX_CLIENTS` fixed slots.
-  `/api/live` is Server-Sent Events; each event is a JSON array of ≤64 records.
-  Sends are nonblocking — a slow browser drops events instead of stalling CAN RX.
-  `/api/control` only whitelists pause/resume/clear/config and forwards CONTROL;
-  it does not wait for the device ACK.
+- `--vcan IFACE`: after dedupe, records are written nonblocking as `struct can_frame`
+  to SocketCAN; `CAN_EFF_FLAG`/`CAN_RTR_FLAG`/`CAN_ERR_FLAG` are mapped and drops are
+  counted, never blocking the epoll loop.
 - `linsight-cli`: control commands use the Unix socket; `export`/`replay`/`compare` read
   files directly and work without a running daemon. `live` is newline-framed candump text.
   `config` sends only explicit fields and waits for the device ACK.
@@ -107,5 +103,5 @@ Chinese, one-line subject plus only necessary bullets; keep `build/`, logs and c
 ## Firmware
 
 Build/flash in the Windows checkout only: `idf.py build`, `idf.py -p COMx flash`.
-Bench Wi-Fi credentials are committed in the firmware repo (`BENCH_*` in `main/net.c`);
+Bench Wi-Fi credentials are Kconfig defaults in the firmware repo (`main/Kconfig.projbuild`);
 do not add secrets or host IPs to this repo.

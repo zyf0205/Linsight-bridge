@@ -91,8 +91,7 @@ def check_rotation(daemon, tmp):
     ctl_port = free_port()
     proc = subprocess.Popen(
         [daemon, "--port", str(port), "--ctl", os.path.join(tmp, "ctl.sock"),
-         "--ctl-port", str(ctl_port), "--log-dir", log_dir, "--log-max-mb", "1",
-         "--http-port", "0"],
+         "--ctl-port", str(ctl_port), "--log-dir", log_dir, "--log-max-mb", "1"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         dev = wait_port(port, proc)
@@ -172,7 +171,7 @@ def start_daemon(daemon, tmp, extra=(), preexec_fn=None):
     proc = subprocess.Popen(
         [daemon, "--port", str(port), "--ctl", os.path.join(tmp, "ctl.sock"),
          "--ctl-port", str(ctl_port), "--log-dir", os.path.join(tmp, "logs"),
-         "--http-port", "0", *extra],
+         *extra],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, preexec_fn=preexec_fn)
     dev = wait_port(port, proc)
     dev.sendall(frame(1, b'{"proto":33,"fw":"2.1.0","device":"fake"}'))

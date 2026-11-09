@@ -2,11 +2,12 @@
  * linsightd — LinSight CAN host daemon (M2).
  *
  * epoll main loop: TCP listener (the device), Unix-socket listener (the CLI),
- * an optional loopback TCP listener (remote CLI), a minimal
- * HTTP + SSE dashboard (web/, epoll clients, no threads), signalfd
+ * an optional loopback TCP listener (remote CLI), signalfd
  * (SIGTERM/SIGINT graceful exit) and a 1 Hz timerfd (stats).
  * One device session at a time; CAN_BATCH records flow into a bounded ring
  * drained by a writer thread that appends to per-session .lsc files.
+ * With --vcan, accepted records are also forwarded to a SocketCAN interface
+ * (e.g. vcan0) for ROS 2 or other local consumers.
  *
  * CLI commands (newline-terminated over the control socket):
  *   stats   -> one JSON status line, socket closes
@@ -33,17 +34,20 @@
 #include <sys/un.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <linux/can.h>
+#include <linux/can/raw.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "canlog.h"
 #include "frame.h"
-#include "http.h"
 #include "session.h"
 
 #define TAG "linsightd"
 
-#define WRING_CAP 131072u /* records; ~3 MB: absorbs a 4 MiB device backlog */
+#define WRING_CAP 262144u /* records; ~6 MB, larger than the device's ~209k ring */
 #define CLI_MAX 8
 #define RX_BUF_SIZE 4096
 #define IDLE_TIMEOUT_MS 30000u
@@ -61,10 +65,10 @@ static const char *g_log_dir = ".";
 static uint64_t g_log_max_bytes; /* 0 = one file per session */
 static uint64_t g_log_max_total_bytes; /* 0 = keep every log */
 static char g_current_log[512];
-static int g_http_port = 8080;    /* 0 disables the dashboard */
-static const char *g_http_bind = "127.0.0.1";
-static const char *g_web_dir = "web";
-static http_server_t *g_http;
+static const char *g_vcan_ifname; /* optional SocketCAN forward target */
+static int g_vcan_fd = -1;
+static uint64_t g_vcan_written;
+static uint64_t g_vcan_dropped;
 
 /* ------------------------------------------------------------ write ring */
 
@@ -109,7 +113,6 @@ typedef struct {
 static wring_t g_ring = {
     .bitrate = 500000,
     .lock = PTHREAD_MUTEX_INITIALIZER,
-    .cond = PTHREAD_COND_INITIALIZER,
 };
 
 static void wring_push(const linsight_can_record_t *recs, uint32_t n)
@@ -348,6 +351,29 @@ static int writer_commit(lsc_writer_t *w, bool close, uint32_t *pending, uint32_
     return rc;
 }
 
+/* fdatasync the current part. On failure, close it and schedule the same
+ * fresh-part retry used by write/flush errors. */
+static void writer_sync(lsc_writer_t *w, bool *log_open, const char *base_path,
+                        uint32_t *log_part, char *reopen_path, size_t reopen_cap,
+                        uint64_t *reopen_after_ms)
+{
+    if (!*log_open) {
+        return;
+    }
+    if (lsc_writer_sync(w) == 0) {
+        return;
+    }
+    fprintf(stderr, TAG ": log sync failed: %s\n", strerror(errno));
+    wring_set_log_error("sync failed");
+    lsc_writer_close(w);
+    *log_open = false;
+    if (base_path[0]) {
+        (*log_part)++;
+        log_part_path(base_path, *log_part, reopen_path, reopen_cap);
+    }
+    *reopen_after_ms = mono_ms() + 2000u;
+}
+
 static void *writer_thread(void *arg)
 {
     (void)arg;
@@ -361,15 +387,24 @@ static void *writer_thread(void *arg)
     char reopen_path[560] = {0};
     uint64_t reopen_after_ms = 0;
     uint64_t retention_after_ms = 0;
+    uint64_t next_sync_ms = 0;
 
     log_retention();
 
     for (;;) {
         pthread_mutex_lock(&g_ring.lock);
         /* A pending open alone has no work: the file is created lazily from
-         * the first record, so only records/close/shutdown wake the writer. */
+         * the first record. The 1 s timeout also wakes an idle writer so the
+         * last flushed batch still gets its periodic fdatasync. */
+        bool timed_out = false;
         while (g_ring.count == 0 && !g_ring.close_req && !g_ring.done) {
-            pthread_cond_wait(&g_ring.cond, &g_ring.lock);
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            ts.tv_sec += 1;
+            if (pthread_cond_timedwait(&g_ring.cond, &g_ring.lock, &ts) == ETIMEDOUT) {
+                timed_out = true;
+                break;
+            }
         }
         const bool finish = g_ring.done;
 
@@ -384,6 +419,14 @@ static void *writer_thread(void *arg)
         }
         g_ring.count -= n;
         pthread_mutex_unlock(&g_ring.lock);
+
+        /* No records for a second: still make the last flushed batch durable. */
+        if (timed_out) {
+            writer_sync(&w, &log_open, base_path, &log_part, reopen_path,
+                        sizeof(reopen_path), &reopen_after_ms);
+            next_sync_ms = mono_ms() + 1000u;
+            continue;
+        }
 
         uint32_t ok = 0;
         uint32_t pending = 0;
@@ -404,6 +447,7 @@ static void *writer_thread(void *arg)
                     wring_set_current_log(reopen_path);
                     wring_set_log_error("");
                     reopen_path[0] = '\0';
+                    next_sync_ms = mono_ms() + 1000u;
                     log_retention();
                 } else {
                     reopen_after_ms = mono_ms() + 2000u;
@@ -444,6 +488,7 @@ static void *writer_thread(void *arg)
                     if (log_open) {
                         wring_set_current_log(base_path);
                         wring_set_log_error("");
+                        next_sync_ms = mono_ms() + 1000u;
                         log_retention();
                     } else {
                         wring_set_log_error("open failed");
@@ -479,6 +524,7 @@ static void *writer_thread(void *arg)
                 if (log_open) {
                     wring_set_current_log(next);
                     wring_set_log_error("");
+                    next_sync_ms = mono_ms() + 1000u;
                     log_retention();
                     fprintf(stderr, TAG ": log rotated to %s\n", next);
                 } else {
@@ -515,6 +561,12 @@ static void *writer_thread(void *arg)
             log_part++;
             log_part_path(base_path, log_part, reopen_path, sizeof(reopen_path));
             reopen_after_ms = mono_ms() + 2000u;
+        }
+
+        if (log_open && mono_ms() >= next_sync_ms) {
+            writer_sync(&w, &log_open, base_path, &log_part, reopen_path,
+                        sizeof(reopen_path), &reopen_after_ms);
+            next_sync_ms = mono_ms() + 1000u;
         }
 
         if (ok < n) {
@@ -634,6 +686,68 @@ static uint64_t wall_ms_now(void)
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* ------------------------------------------------------- SocketCAN forward */
+
+static int vcan_open(const char *ifname)
+{
+    const int fd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (fd < 0) {
+        fprintf(stderr, TAG ": vcan socket: %s\n", strerror(errno));
+        return -1;
+    }
+
+    struct ifreq ifr = {0};
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", ifname);
+    if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
+        fprintf(stderr, TAG ": vcan %s: %s\n", ifname, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    struct sockaddr_can addr = {0};
+    addr.can_family = AF_CAN;
+    addr.can_ifindex = ifr.ifr_ifindex;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, TAG ": vcan bind %s: %s\n", ifname, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    set_nonblock(fd);
+    return fd;
+}
+
+/* Best-effort, nonblocking: a full interface queue drops this frame and never
+ * stalls the device RX/writer path. */
+static void vcan_forward(const linsight_can_record_t *recs, uint32_t n)
+{
+    if (g_vcan_fd < 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        struct can_frame cf = {0};
+        if (recs[i].flags & LINSIGHT_REC_FLAG_EXT) {
+            cf.can_id = (recs[i].id & CAN_EFF_MASK) | CAN_EFF_FLAG;
+        } else {
+            cf.can_id = recs[i].id & CAN_SFF_MASK;
+        }
+        if (recs[i].flags & LINSIGHT_REC_FLAG_RTR) {
+            cf.can_id |= CAN_RTR_FLAG;
+        }
+        if (recs[i].flags & LINSIGHT_REC_FLAG_ERR) {
+            cf.can_id |= CAN_ERR_FLAG;
+        }
+        cf.can_dlc = recs[i].dlc > 8 ? 8 : recs[i].dlc;
+        memcpy(cf.data, recs[i].data, cf.can_dlc);
+
+        if (write(g_vcan_fd, &cf, sizeof(cf)) != (ssize_t)sizeof(cf)) {
+            g_vcan_dropped++;
+        } else {
+            g_vcan_written++;
+        }
+    }
 }
 
 /* ------------------------------------------------------- output queues */
@@ -791,11 +905,6 @@ static bool send_control_fields(const char *action, const char *fields)
     return device_queue_frame(LINSIGHT_FRAME_CONTROL, json, (uint16_t)n);
 }
 
-static bool send_control(const char *action)
-{
-    return send_control_fields(action, NULL);
-}
-
 /* ------------------------------------------------------------- frames */
 
 static void deliver_live(const linsight_can_record_t *recs, uint32_t n)
@@ -832,11 +941,6 @@ static void deliver_live(const linsight_can_record_t *recs, uint32_t n)
              * line rather than blocking or closing the client. */
             (void)cli_queue(cli, line, (size_t)len);
         }
-    }
-
-    /* Web dashboard gets the unfiltered batch; filtering is client-side. */
-    if (g_http) {
-        http_broadcast_records(g_http, recs, n);
     }
 }
 
@@ -879,6 +983,7 @@ static void handle_batch(const uint8_t *payload, uint16_t len)
     g_dev.recs += valid;
 
     if (accepted) {
+        vcan_forward(recs, accepted);
         if (!g_dev.anchor_valid) {
             /* Old firmware without HELLO uptime: map the first record's
              * uptime onto the current wall clock. */
@@ -1153,10 +1258,11 @@ static size_t build_stats_json(char *out, size_t cap)
 
     const int n = snprintf(
         out, cap,
-        "{\"version\":\"0.3.0\",\"device\":%s,\"device_id\":\"%s\",\"boot\":%u,"
+        "{\"version\":\"0.4.0\",\"device\":%s,\"device_id\":\"%s\",\"boot\":%u,"
         "\"records\":%llu,\"recv_raw\":%llu,\"backlog_skipped\":%llu,"
         "\"seq_gaps\":%llu,\"seq_missing\":%llu,\"seq_ambiguous\":%llu,"
         "\"written\":%llu,\"dropped\":%llu,\"log\":\"%s\",\"log_error\":\"%s\","
+        "\"vcan\":\"%s\",\"vcan_written\":%llu,\"vcan_dropped\":%llu,"
         "\"anchor_wall_ms\":%llu,\"stats\":%s,\"info\":%s}",
         g_dev.fd >= 0 ? "true" : "false", g_dev.device_id, (unsigned)g_dev.boot_count,
         (unsigned long long)g_dev.sess.accepted,
@@ -1165,52 +1271,14 @@ static size_t build_stats_json(char *out, size_t cap)
         (unsigned long long)g_dev.sess.missing, (unsigned long long)g_dev.sess.ambiguous,
         (unsigned long long)written, (unsigned long long)dropped,
         log_path[0] ? log_path : "", log_error,
+        g_vcan_ifname ? g_vcan_ifname : "",
+        (unsigned long long)g_vcan_written, (unsigned long long)g_vcan_dropped,
         (unsigned long long)g_dev.anchor_wall_ms,
         g_dev.stats[0] ? g_dev.stats : "{}", g_dev.info[0] ? g_dev.info : "{}");
     if (n <= 0 || (size_t)n >= cap) {
         return 0;
     }
     return (size_t)n;
-}
-
-/* Dashboard control endpoint: same whitelist as the CLI, ACK still goes to the
- * device (the web UI observes the resulting STATS). */
-static bool web_control(void *ctx, const char *cmd, char *err, size_t errcap)
-{
-    (void)ctx;
-    if (strcmp(cmd, "pause") == 0 || strcmp(cmd, "resume") == 0 ||
-        strcmp(cmd, "clear") == 0) {
-        if (g_dev.fd < 0) {
-            snprintf(err, errcap, "no device");
-            return false;
-        }
-        send_control(strcmp(cmd, "clear") == 0 ? "clear_stats" : cmd);
-        return true;
-    }
-    if (strncmp(cmd, "config ", 7) == 0) {
-        char fields[96];
-        if (!build_config_fields(cmd + 7, fields, sizeof(fields))) {
-            snprintf(err, errcap, "bad config");
-            return false;
-        }
-        if (g_dev.fd < 0) {
-            snprintf(err, errcap, "no device");
-            return false;
-        }
-        if (!send_control_fields(LINSIGHT_CTRL_CONFIG, fields)) {
-            snprintf(err, errcap, "send failed");
-            return false;
-        }
-        return true;
-    }
-    snprintf(err, errcap, "unknown command");
-    return false;
-}
-
-static size_t web_stats(void *ctx, char *out, size_t cap)
-{
-    (void)ctx;
-    return build_stats_json(out, cap);
 }
 
 static void cli_dispatch(cli_conn_t *c)
@@ -1406,27 +1474,25 @@ int main(int argc, char **argv)
                 return 1;
             }
             g_log_max_total_bytes = mb * 1024ull * 1024ull;
-        } else if (strcmp(argv[i], "--http-port") == 0 && i + 1 < argc) {
-            const int p = atoi(argv[++i]);
-            if (p < 0 || p > 65535) {
-                fprintf(stderr, "linsightd: bad http port '%s'\n", argv[i]);
-                return 1;
-            }
-            g_http_port = p; /* 0 disables the dashboard */
-        } else if (strcmp(argv[i], "--http-bind") == 0 && i + 1 < argc) {
-            g_http_bind = argv[++i];
-        } else if (strcmp(argv[i], "--web-dir") == 0 && i + 1 < argc) {
-            g_web_dir = argv[++i];
+        } else if (strcmp(argv[i], "--vcan") == 0 && i + 1 < argc) {
+            g_vcan_ifname = argv[++i];
         } else {
             fprintf(stderr,
                     "usage: linsightd [--port N] [--ctl PATH] [--ctl-port N] "
                     "[--log-dir DIR]\n"
                     "                  [--log-max-mb N] [--log-max-total-mb N] "
-                    "[--http-port N] [--http-bind ADDR] [--web-dir DIR]\n");
+                    "[--vcan IFACE]\n");
             return 1;
         }
     }
     mkdir(g_log_dir, 0755);
+
+    if (g_vcan_ifname) {
+        g_vcan_fd = vcan_open(g_vcan_ifname);
+        if (g_vcan_fd < 0) {
+            return 1;
+        }
+    }
 
     sigset_t mask;
     sigemptyset(&mask);
@@ -1481,13 +1547,14 @@ int main(int argc, char **argv)
     ev.data.u64 = 4; /* timer */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, tfd, &ev);
 
-    if (g_http_port > 0) {
-        g_http = http_server_new(g_epoll, g_http_bind, (uint16_t)g_http_port, g_web_dir,
-                                 web_stats, web_control, NULL);
-        if (!g_http) {
-            fprintf(stderr, TAG ": web dashboard disabled (listen failed)\n");
-        }
+    pthread_condattr_t cattr;
+    pthread_condattr_init(&cattr);
+    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+    if (pthread_cond_init(&g_ring.cond, &cattr) != 0) {
+        fprintf(stderr, TAG ": cond init failed\n");
+        return 1;
     }
+    pthread_condattr_destroy(&cattr);
 
     pthread_t writer;
     if (pthread_create(&writer, NULL, writer_thread, NULL) != 0) {
@@ -1500,9 +1567,8 @@ int main(int argc, char **argv)
     if (ctl_tcp_fd >= 0) {
         fprintf(stderr, TAG ": tcp control on 127.0.0.1:%s\n", g_ctl_port);
     }
-    if (g_http) {
-        fprintf(stderr, TAG ": web dashboard on http://%s:%d (web-dir %s)\n",
-                g_http_bind, g_http_port, g_web_dir);
+    if (g_vcan_fd >= 0) {
+        fprintf(stderr, TAG ": forwarding to SocketCAN %s\n", g_vcan_ifname);
     }
 
     uint64_t last_recs = 0;
@@ -1591,12 +1657,6 @@ int main(int argc, char **argv)
                     fprintf(stderr, TAG ": protocol error, closing device\n");
                     device_close();
                 }
-            } else if (tag == HTTP_TAG_LISTEN) {
-                http_server_accept(g_http);
-            } else if (tag >= HTTP_TAG_CLIENT_BASE &&
-                       tag < HTTP_TAG_CLIENT_BASE + HTTP_MAX_CLIENTS) {
-                http_server_handle(g_http, (int)(tag - HTTP_TAG_CLIENT_BASE),
-                                   events[i].events);
             } else { /* cli conn */
                 const uint32_t revents = events[i].events;
                 if (revents & EPOLLOUT) {
@@ -1631,13 +1691,16 @@ int main(int argc, char **argv)
             cli_close(&g_cli[i]);
         }
     }
-    http_server_free(g_http);
-    g_http = NULL;
+    if (g_vcan_fd >= 0) {
+        close(g_vcan_fd);
+        g_vcan_fd = -1;
+    }
     pthread_mutex_lock(&g_ring.lock);
     g_ring.done = true;
     pthread_cond_signal(&g_ring.cond);
     pthread_mutex_unlock(&g_ring.lock);
     pthread_join(writer, NULL);
+    pthread_cond_destroy(&g_ring.cond);
     close(tcp_fd);
     close(unix_fd);
     if (ctl_tcp_fd >= 0) {
