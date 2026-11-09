@@ -21,7 +21,6 @@ add_executable(linsightd
     src/canlog.c
     src/http.c
     src/session.c
-    src/sim.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
 target_link_libraries(linsightd pthread rt)
 
@@ -60,9 +59,6 @@ target_include_directories(test_dbc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_executable(test_session tests/test_session.c src/session.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
 target_include_directories(test_session PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-add_executable(test_sim tests/test_sim.c src/sim.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
-target_include_directories(test_sim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_executable(test_export tests/test_export.c src/canlog.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
 target_include_directories(test_export PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -77,7 +73,6 @@ add_test(NAME canlog COMMAND test_canlog)
 add_test(NAME compare COMMAND test_compare)
 add_test(NAME dbc COMMAND test_dbc)
 add_test(NAME session COMMAND test_session)
-add_test(NAME sim COMMAND test_sim)
 add_test(NAME export COMMAND test_export)
 add_test(NAME import COMMAND test_import)
 

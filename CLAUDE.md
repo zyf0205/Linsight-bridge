@@ -9,11 +9,11 @@ ctest suite. The ESP32-S3 firmware, Wi-Fi credentials, and flashing live in the 
 Windows checkout `D:\_study\projects\_MyProject\LinSight`; this repo does not build firmware.
 
 Layout:
-- `host/src/` — daemon, `.lsc` writer/reader, replay, compare, DBC, device session, HTTP/SSE, traffic simulator
-- `host/cli/` — stats/live/config/pause/resume/clear/export/replay/compare/decode/sim
+- `host/src/` — daemon, `.lsc` writer/reader, replay, compare, DBC, device session, HTTP/SSE
+- `host/cli/` — stats/live/config/pause/resume/clear/export/replay/compare/decode
 - `host/web/index.html` — single-file dashboard (served by `linsightd`, no build step)
 - `host/systemd/` — service unit + `/etc/default` args (CMake `install` targets)
-- `host/tests/` — record/parser/fuzz/ring/canlog/compare/dbc/session/export/import/sim/integration/rotation
+- `host/tests/` — record/parser/fuzz/ring/canlog/compare/dbc/session/export/import/integration/rotation
 - `protocol/` — shared v2.1 parser (mirror of the firmware repo)
 - `firmware/can_ring.c/h` — read-only copy of the firmware ring for `test_ring`
 - `tools/can-up.sh` / `can-down.sh` — one-shot usbipd + peak_usb + can0 bring-up/teardown
@@ -65,12 +65,6 @@ Bench (PCAN via usbipd; the Windows GUI is legacy/removed):
 cangen can0 -n 500 -g 20 -I 0x123 -L 8 # 50 fps x 10 s; device total is ground truth
 ```
 
-Simulator (no hardware or device needed; host-side only):
-```bash
-build/linsight-cli sim start engine|bms|mix|counter [1..1000]
-build/linsight-cli sim stop | sim status | sim inject 1AB DE AD BE EF
-```
-
 ## Architecture
 
 - `linsightd`: epoll main loop; TCP listener for the device (`INADDR_ANY`), Unix socket
@@ -82,15 +76,8 @@ build/linsight-cli sim stop | sim status | sim inject 1AB DE AD BE EF
 - HTTP dashboard (`src/http.c`): same epoll loop, `HTTP_MAX_CLIENTS` fixed slots.
   `/api/live` is Server-Sent Events; each event is a JSON array of ≤64 records.
   Sends are nonblocking — a slow browser drops events instead of stalling CAN RX.
-  `/api/control` only whitelists pause/resume/clear/config/sim and forwards CONTROL
-  (except `sim`, which is handled in-process); it does not wait for the device ACK.
-- Traffic simulator (`src/sim.c`): 10 Hz timerfd in the same epoll loop emits
-  pattern frames (`engine`/`bms`/`mix`/`counter`, 1–1000 fps, fractional carry so
-  slow rates stay even) straight into the real ingest path — writer ring, CLI
-  `live`, SSE — so simulated traffic is indistinguishable downstream. Records
-  carry a monotone `seq` like the device, otherwise `verify` reports duplicates.
-  It opens its own `.lsc` session when no device is connected and defers to a
-  real device session when one appears. Host-side only: never touches the bus.
+  `/api/control` only whitelists pause/resume/clear/config and forwards CONTROL;
+  it does not wait for the device ACK.
 - `linsight-cli`: control commands use the Unix socket; `export`/`replay`/`compare` read
   files directly and work without a running daemon. `live` is newline-framed candump text.
   `config` sends only explicit fields and waits for the device ACK.

@@ -15,13 +15,13 @@ device ──Wi-Fi/TCP── linsightd ── .lsc writer thread
 ```bash
 cd host
 cmake -S . -B build && cmake --build build -j"$(nproc)"
-ctest --test-dir build --output-on-failure        # 13 tests
+ctest --test-dir build --output-on-failure        # 12 tests
 cmake -S . -B build-asan -DLINSIGHT_SANITIZE=ON   # ASan/UBSan
 ```
 
 Tests cover the shared parser (including fuzz), record layout, the firmware ring
 drop-oldest policy, `.lsc` reader snapshots, HELLO anchoring/dedupe, candump/ASC
-export shape, SD-style import/verify, the traffic simulator, `compare`, and two
+export shape, SD-style import/verify, `compare`, and two
 end-to-end daemon tests:
 device→CLI/log/HTTP and size-based log rotation.
 
@@ -128,25 +128,6 @@ sudo ip link set can0 type can bitrate 500000 && sudo ip link set can0 up
 cangen can0 -n 500 -g 20 -I 0x123 -L 8
 build/linsight-cli stats --watch
 ```
-
-### Built-in traffic simulator (no hardware)
-
-`linsightd` can generate its own frames, so the dashboard, CLI `live`, `.lsc`
-writer and `verify` all work without a CAN adapter or a device:
-
-```bash
-build/linsight-cli sim start engine 50    # patterns: engine|bms|mix|counter
-build/linsight-cli sim stop
-build/linsight-cli sim status
-build/linsight-cli sim inject 1AB DE AD BE EF
-```
-
-The dashboard has the same controls (Simulate row: pattern, rate, Start/Stop,
-Inject). Simulated records carry a monotone `seq` and reuse the real ingest
-path, so `verify FILE.lsc --strict` reports no gaps or duplicates. The
-`counter` pattern matches `can_soak.py`'s layout (`0x123`, LE u32 + 11 22 33 44)
-for end-to-end soak checks. Sim traffic is host-side only: it never reaches the
-CAN bus or the device.
 
 For counter-checked soaks use `../tools/can_soak.py` (AF_CAN generator, 32-bit
 payload counter) and compare the captured `.lsc` against the send sequence.
