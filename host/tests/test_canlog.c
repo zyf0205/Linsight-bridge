@@ -113,6 +113,9 @@ static void corrupt_byte(size_t offset, unsigned char value)
 {
     FILE *f = fopen(g_path, "r+b");
     CHECK(f != NULL);
+    if (!f) {
+        return;
+    }
     CHECK(fseek(f, (long)offset, SEEK_SET) == 0);
     CHECK(fputc(value, f) == value);
     fclose(f);
@@ -136,6 +139,9 @@ static void test_rejects_bad_header(void)
     write_sample();
     FILE *f = fopen(g_path, "ab");
     CHECK(f != NULL);
+    if (!f) {
+        return;
+    }
     const unsigned char tail[7] = {1, 2, 3, 4, 5, 6, 7};
     CHECK(fwrite(tail, 1, sizeof(tail), f) == sizeof(tail));
     fclose(f);
@@ -161,6 +167,10 @@ static void test_reader_snapshot(void)
      * to stop at the snapshot while the daemon keeps writing the same file. */
     FILE *f = fopen(g_path, "ab");
     CHECK(f != NULL);
+    if (!f) {
+        lsc_reader_close(&r);
+        return;
+    }
     const linsight_can_record_t extra = {
         .seq = 3, .ts_ms = 5000, .id = 0x456, .flags = 0, .dlc = 1, .data = {0x55}};
     uint8_t buf[LINSIGHT_REC_SIZE];

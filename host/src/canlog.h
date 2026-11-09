@@ -94,7 +94,5 @@ long canlog_export_candump_filtered(const char *lsc_path, const char *out_path,
 
 /* Format one record as a candump line using the given session start time.
  * Returns the string length, or -1 when buf is too small. */
-int canlog_format_candump(const linsight_can_record_t *r, uint64_t start_wall, char *buf,
-                          size_t cap);
 int canlog_format_candump_ms(const linsight_can_record_t *r, uint64_t start_wall_ms, char *buf,
                              size_t cap);

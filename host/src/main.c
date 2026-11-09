@@ -2,7 +2,7 @@
  * linsightd — LinSight CAN host daemon (M2).
  *
  * epoll main loop: TCP listener (the device), Unix-socket listener (the CLI),
- * an optional loopback TCP listener (Windows GUI / remote CLI), a minimal
+ * an optional loopback TCP listener (remote CLI), a minimal
  * HTTP + SSE dashboard (web/, epoll clients, no threads), signalfd
  * (SIGTERM/SIGINT graceful exit) and a 1 Hz timerfd (stats).
  * One device session at a time; CAN_BATCH records flow into a bounded ring
@@ -17,10 +17,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +52,7 @@
 #define CLI_OUT_CAP 4096u
 #define MAX_EVENTS 64
 #define ACK_TIMEOUT_MS 3000u
+#define CLI_TAG_BASE 0x100u /* epoll tag range for CLI sockets */
 
 static const char *g_port = "8888";
 static const char *g_ctl_path = "/tmp/linsight.sock";
@@ -268,6 +267,7 @@ static void log_part_path(const char *base, uint32_t part, char *out, size_t cap
 }
 
 static uint64_t mono_ms(void);
+static uint64_t wall_ms_now(void);
 
 static int log_filter(const struct dirent *e)
 {
@@ -399,11 +399,8 @@ static void *writer_thread(void *arg)
                     if (!start_wall_ms) {
                         /* No HELLO uptime (old firmware): map this record's
                          * uptime onto the current wall clock. */
-                        struct timespec ts;
-                        clock_gettime(CLOCK_REALTIME, &ts);
-                        const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u +
-                                                (uint64_t)ts.tv_nsec / 1000000u;
-                        start_wall_ms = now_ms > e->rec.ts_ms ? now_ms - e->rec.ts_ms : 0;
+                        start_wall_ms =
+                            session_anchor_start_wall_ms(wall_ms_now(), e->rec.ts_ms);
                     }
                     const lsc_open_info_t info = {
                         .start_wall_ms = start_wall_ms,
@@ -442,7 +439,6 @@ static void *writer_thread(void *arg)
                     g_log_max_bytes) {
                 char next[560];
                 lsc_writer_close(&w);
-                log_open = false;
                 log_part++;
                 log_part_path(base_path, log_part, next, sizeof(next));
                 const lsc_open_info_t info = {
@@ -591,6 +587,13 @@ static uint64_t mono_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+static uint64_t wall_ms_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
 /* ------------------------------------------------------- output queues */
 
 static void cli_close(cli_conn_t *c);
@@ -615,7 +618,7 @@ static void cli_update_epoll(cli_conn_t *c)
     }
     struct epoll_event ev = {
         .events = EPOLLIN | (c->out_len > c->out_off ? EPOLLOUT : 0),
-        .data.u64 = 0x100u + (uint64_t)(c - g_cli),
+        .data.u64 = CLI_TAG_BASE + (uint64_t)(c - g_cli),
     };
     epoll_ctl(g_epoll, EPOLL_CTL_MOD, c->fd, &ev);
 }
@@ -772,8 +775,8 @@ static void deliver_live(const linsight_can_record_t *recs, uint32_t n)
                 continue;
             }
             if (!formatted) {
-                /* Newline-terminated: `live` is a line-oriented stream for the
-                 * CLI and the bench GUI. */
+                /* Newline-terminated: `live` is a line-oriented stream for
+                 * the CLI. */
                 len = canlog_format_candump_ms(&recs[i], g_session_start_ms, line,
                                                sizeof(line) - 1);
                 formatted = true;
@@ -837,12 +840,8 @@ static void handle_batch(const uint8_t *payload, uint16_t len)
         if (!g_dev.anchor_valid) {
             /* Old firmware without HELLO uptime: map the first record's
              * uptime onto the current wall clock. */
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u +
-                                    (uint64_t)ts.tv_nsec / 1000000u;
             g_dev.anchor_wall_ms =
-                now_ms > recs[0].ts_ms ? now_ms - recs[0].ts_ms : 0;
+                session_anchor_start_wall_ms(wall_ms_now(), recs[0].ts_ms);
             g_dev.anchor_valid = true;
             g_session_start_ms = g_dev.anchor_wall_ms;
             wring_set_anchor_info(g_dev.anchor_wall_ms, g_dev.boot_count);
@@ -871,12 +870,8 @@ static void handle_frame(void *ctx, uint8_t type, const uint8_t *payload, uint16
         g_dev.boot_count = h.boot_count;
         session_reset(&g_dev.sess, h.boot_count, h.has_boot);
         if (h.has_uptime) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000u +
-                                    (uint64_t)ts.tv_nsec / 1000000u;
             g_dev.anchor_wall_ms =
-                session_anchor_start_wall_ms(now_ms, h.uptime_ms);
+                session_anchor_start_wall_ms(wall_ms_now(), h.uptime_ms);
             g_dev.anchor_valid = true;
             g_session_start_ms = g_dev.anchor_wall_ms;
             wring_set_anchor_info(g_dev.anchor_wall_ms, h.boot_count);
@@ -1281,67 +1276,53 @@ static void cli_accept(int listen_fd)
     slot->fd = fd;
     slot->filter_ext = -1;
     /* Use u64 tags everywhere; .ptr/u32 union mixes are ambiguous on 64-bit. */
-    struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 0x100u + (uint64_t)(slot - g_cli)};
+    struct epoll_event ev = {.events = EPOLLIN,
+                             .data.u64 = CLI_TAG_BASE + (uint64_t)(slot - g_cli)};
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, fd, &ev);
 }
 
 /* ---------------------------------------------------------------- main */
 
-static int make_listener(const char *port, bool unix_socket)
-{
-    int fd;
-    if (unix_socket) {
-        unlink(g_ctl_path);
-        fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (fd < 0) {
-            return -1;
-        }
-        struct sockaddr_un addr = {.sun_family = AF_UNIX};
-        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", g_ctl_path);
-        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-            listen(fd, 4) < 0) {
-            close(fd);
-            return -1;
-        }
-        chmod(g_ctl_path, 0666);
-    } else {
-        fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (fd < 0) {
-            return -1;
-        }
-        static int one = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        struct sockaddr_in addr = {.sin_family = AF_INET};
-        addr.sin_port = htons((uint16_t)atoi(port));
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
-        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 4) < 0) {
-            close(fd);
-            return -1;
-        }
-    }
-    set_nonblock(fd);
-    return fd;
-}
-
-/* Optional TCP control endpoint, bound to loopback only. It speaks the exact
- * same line protocol as the Unix socket, so a GUI running on Windows can drive
- * the daemon in WSL without a second protocol implementation. */
-static int make_loopback_listener(const char *port)
+/* addr_host is INADDR_ANY for the device listener or INADDR_LOOPBACK for the
+ * optional control port, which speaks the same line protocol as the Unix
+ * socket so a remote client needs no second implementation. */
+static int make_tcp_listener(const char *port, uint32_t addr_host)
 {
     const int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         return -1;
     }
-    static int one = 1;
+    static const int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in addr = {.sin_family = AF_INET};
     addr.sin_port = htons((uint16_t)atoi(port));
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-        listen(fd, 4) < 0) {
+    addr.sin_addr.s_addr = htonl(addr_host);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 4) < 0) {
         close(fd);
         return -1;
     }
+    set_nonblock(fd);
+    return fd;
+}
+
+static int make_listener(const char *port, bool unix_socket)
+{
+    if (!unix_socket) {
+        return make_tcp_listener(port, INADDR_ANY);
+    }
+
+    unlink(g_ctl_path);
+    const int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_un addr = {.sun_family = AF_UNIX};
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", g_ctl_path);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 4) < 0) {
+        close(fd);
+        return -1;
+    }
+    chmod(g_ctl_path, 0666);
     set_nonblock(fd);
     return fd;
 }
@@ -1416,7 +1397,7 @@ int main(int argc, char **argv)
 
     const int tcp_fd = make_listener(g_port, false);
     const int unix_fd = make_listener(g_ctl_path, true);
-    const int ctl_tcp_fd = g_ctl_port ? make_loopback_listener(g_ctl_port) : -1;
+    const int ctl_tcp_fd = g_ctl_port ? make_tcp_listener(g_ctl_port, INADDR_LOOPBACK) : -1;
     if (tcp_fd < 0 || unix_fd < 0 || (g_ctl_port && ctl_tcp_fd < 0) || sigfd < 0) {
         fprintf(stderr, TAG ": listener setup failed: %s\n", strerror(errno));
         return 1;
@@ -1489,8 +1470,8 @@ int main(int argc, char **argv)
         for (int i = 0; i < n; i++) {
             const uint64_t tag = events[i].data.u64;
             cli_conn_t *cli = NULL;
-            if (tag >= 0x100u && tag < 0x100u + CLI_MAX) {
-                cli = &g_cli[tag - 0x100u];
+            if (tag >= CLI_TAG_BASE && tag < CLI_TAG_BASE + CLI_MAX) {
+                cli = &g_cli[tag - CLI_TAG_BASE];
             }
 
             if (tag == 3) { /* signal */
@@ -1514,9 +1495,12 @@ int main(int argc, char **argv)
                 const uint64_t written = g_ring.written;
                 const uint64_t dropped = g_ring.dropped;
                 pthread_mutex_unlock(&g_ring.lock);
+                /* A reconnect resets g_dev.recs; report just the new session
+                 * instead of underflowing the delta. */
+                const uint64_t delta =
+                    g_dev.recs >= last_recs ? g_dev.recs - last_recs : g_dev.recs;
                 fprintf(stderr, TAG ": recs=%llu (+%llu) written=%llu dropped=%llu\n",
-                        (unsigned long long)g_dev.recs,
-                        (unsigned long long)(g_dev.recs - last_recs),
+                        (unsigned long long)g_dev.recs, (unsigned long long)delta,
                         (unsigned long long)written, (unsigned long long)dropped);
                 last_recs = g_dev.recs;
 

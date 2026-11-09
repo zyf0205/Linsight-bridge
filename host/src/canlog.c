@@ -218,7 +218,6 @@ long lsc_read(const char *path, lsc_record_cb cb, void *ctx)
 typedef struct {
     FILE *out;
     uint64_t start_wall_ms;
-    uint32_t bitrate;
     const lsc_filter_t *filter;
     long count;
     bool asc; /* write the Vector ASC header/footer */
@@ -303,7 +302,6 @@ static long export_common(const char *lsc_path, const char *out_path, lsc_record
 
     export_ctx_t e = {
         .start_wall_ms = rd.start_wall_ms,
-        .bitrate = rd.bitrate,
         .filter = filter,
         .asc = cb == export_asc_cb,
     };
@@ -405,10 +403,4 @@ int canlog_format_candump_ms(const linsight_can_record_t *r, uint64_t start_wall
         used += n;
     }
     return used;
-}
-
-int canlog_format_candump(const linsight_can_record_t *r, uint64_t start_wall, char *buf,
-                          size_t cap)
-{
-    return canlog_format_candump_ms(r, start_wall * 1000u, buf, cap);
 }

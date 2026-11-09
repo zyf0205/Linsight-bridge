@@ -70,8 +70,8 @@ cangen can0 -n 500 -g 20 -I 0x123 -L 8 # 50 fps x 10 s; device total is ground t
 
 - `linsightd`: epoll main loop; TCP listener for the device (`INADDR_ANY`), Unix socket
   `/tmp/linsight.sock` for the CLI, optional loopback `--ctl-port`, optional HTTP
-  dashboard, signalfd, 1 Hz timerfd. Writer thread: bounded 16384-record ring ->
-  per-session `can-YYYYMMDD-HHMMSS-NNN.lsc`; close ordered before open.
+  dashboard, signalfd, 1 Hz timerfd. Writer thread: bounded 131072-record ring
+  (~3 MiB) -> per-session `can-YYYYMMDD-HHMMSS-NNN.lsc`; close ordered before open.
   `--log-max-mb N` rotates a session into `-pNNN` parts before a record crosses the
   cap; all parts share the session anchor, so timestamps stay continuous.
 - HTTP dashboard (`src/http.c`): same epoll loop, `HTTP_MAX_CLIENTS` fixed slots.
