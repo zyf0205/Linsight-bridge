@@ -11,7 +11,7 @@
 | 支柱 | 实现载体 | 验收证据 |
 |---|---|---|
 | MCU / RTOS | TWAI 采集、PSRAM ring、双子历史缓冲、Wi-Fi/TCP、任务优先级 | M3.4 / M3.5 |
-| LVGL | 320×240 双页 UI、4 列固定坐标 trace、过滤/触发、跨任务邮箱 | M3.1 的 UI 项 |
+| LVGL | 320×240 三视图 UI（总线健康概览 / Raw trace / Settings）、Top-ID 1 s 速率排名、过滤/触发、跨任务邮箱 | M3.1 的 UI 项 |
 | Linux 系统 | epoll/signalfd/timerfd、非阻塞 socket、Unix socket、写线程 + 有界 ring、二进制日志、HTTP/SSE | M4 P0、M5、M6 soak |
 | 工程化 | 共享纯 C 协议、fuzz、ctest/ASan、台架工具、文档单一事实源 | M3.0、M4 CI |
 
@@ -113,7 +113,7 @@ Web：`src/http.c` 在同一 epoll 循环提供最小 HTTP/1.1 + SSE；`host/web
 阻塞靠本地 ring + 丢弃计数兜底；SD 掉电/坏卡靠轮转 + 保留策略兜底；台架通过前不扩功能。
 
 > **LinSight CAN — 无线 CAN 总线分析仪（ESP32-S3 + Linux）**
-> - TWAI 采集 + PSRAM ring + 时间戳；LVGL 触摸屏 20 fps 实时 trace/负载/错误。
+> - TWAI 采集 + PSRAM ring + 时间戳；LVGL 触摸屏总线健康概览（Top-ID 1 s 速率）+ 20 fps Raw trace。
 > - Linux C 守护进程：epoll + 非阻塞 TCP + 写线程 + 二进制日志/ASC 导出 + CLI。
 > - 10.9 min 连续 60 万帧零丢帧（计数器逐帧校验）、1 Mbps 稳定、bus-off 自愈；24 h 长跑可选。
 > - 共享协议解析器 fuzz + ctest/ASan CI；SocketCAN 回放与双路对照（M4）。
