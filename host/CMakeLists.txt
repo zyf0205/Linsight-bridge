@@ -13,57 +13,58 @@ if(LINSIGHT_SANITIZE)
     add_link_options(-fsanitize=address,undefined)
 endif()
 
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../protocol)
-
-# linsightd: epoll daemon, .lsc writer thread, Unix-socket control
-add_executable(linsightd
-    src/main.c
+# Shared host code: .lsc I/O, session dedupe and the v2.1 parser.
+add_library(linsight_core STATIC
     src/canlog.c
     src/session.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
-target_link_libraries(linsightd pthread rt)
+target_include_directories(linsight_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol)
 
-# linsight-cli: stats / live / export via control socket and .lsc files
-add_executable(linsight-cli
-    cli/cli.c
-    src/canlog.c
+# Offline file tools used only by linsight-cli.
+add_library(linsight_offline STATIC
     src/compare.c
     src/dbc.c
     src/replay.c
-    src/session.c
-    src/import.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
-target_include_directories(linsight-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(linsight-cli rt)
+    src/import.c)
+target_link_libraries(linsight_offline PUBLIC linsight_core)
+
+# linsightd: epoll daemon, .lsc writer thread, Unix-socket control
+add_executable(linsightd src/main.c)
+target_link_libraries(linsightd PRIVATE linsight_core pthread rt)
+
+# linsight-cli: stats / live / export via control socket and .lsc files
+add_executable(linsight-cli cli/cli.c)
+target_link_libraries(linsight-cli PRIVATE linsight_offline rt)
 
 enable_testing()
-add_executable(test_record tests/test_record.c ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
-add_executable(test_parser tests/test_parser.c ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
-add_executable(test_fuzz tests/test_fuzz.c ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
+add_executable(test_record tests/test_record.c)
+target_link_libraries(test_record PRIVATE linsight_core)
+add_executable(test_parser tests/test_parser.c)
+target_link_libraries(test_parser PRIVATE linsight_core)
+add_executable(test_fuzz tests/test_fuzz.c)
+target_link_libraries(test_fuzz PRIVATE linsight_core)
 # Firmware ring compiled against tiny ESP-IDF shims: verifies drop-oldest order.
 add_executable(test_ring tests/test_ring.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../firmware/can_ring.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../firmware/can_ring.c)
+target_link_libraries(test_ring PRIVATE linsight_core)
 target_include_directories(test_ring PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/shims
     ${CMAKE_CURRENT_SOURCE_DIR}/../firmware)
-add_executable(test_canlog tests/test_canlog.c src/canlog.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
-target_include_directories(test_canlog PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-add_executable(test_compare tests/test_compare.c src/canlog.c src/compare.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
-target_include_directories(test_compare PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-add_executable(test_dbc tests/test_dbc.c src/dbc.c)
-target_include_directories(test_dbc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-add_executable(test_session tests/test_session.c src/session.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
-target_include_directories(test_session PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-add_executable(test_export tests/test_export.c src/canlog.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
-target_include_directories(test_export PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-add_executable(test_import tests/test_import.c src/import.c src/session.c src/canlog.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/frame.c)
-target_include_directories(test_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_executable(test_canlog tests/test_canlog.c)
+target_link_libraries(test_canlog PRIVATE linsight_core)
+add_executable(test_compare tests/test_compare.c)
+target_link_libraries(test_compare PRIVATE linsight_offline)
+add_executable(test_dbc tests/test_dbc.c)
+target_link_libraries(test_dbc PRIVATE linsight_offline)
+add_executable(test_session tests/test_session.c)
+target_link_libraries(test_session PRIVATE linsight_core)
+add_executable(test_export tests/test_export.c)
+target_link_libraries(test_export PRIVATE linsight_core)
+add_executable(test_import tests/test_import.c)
+target_link_libraries(test_import PRIVATE linsight_offline)
+
 add_test(NAME record COMMAND test_record)
 add_test(NAME parser COMMAND test_parser)
 add_test(NAME fuzz COMMAND test_fuzz)

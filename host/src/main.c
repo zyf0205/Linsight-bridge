@@ -24,7 +24,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
@@ -42,6 +41,7 @@
 #include <unistd.h>
 
 #include "canlog.h"
+#include "ctl_proto.h"
 #include "frame.h"
 #include "session.h"
 
@@ -1198,8 +1198,7 @@ static bool build_config_fields(const char *args, char *out, size_t cap)
         if (strncmp(args, "bitrate=", 8) == 0) {
             char *end = NULL;
             const long v = strtol(args + 8, &end, 10);
-            if (end == args + 8 ||
-                (v != 125000 && v != 250000 && v != 500000 && v != 1000000)) {
+            if (end == args + 8 || !linsight_bitrate_valid(v)) {
                 return false;
             }
             const int n = snprintf(out + used, cap - used, "%s\"bitrate\":%ld",
@@ -1223,11 +1222,7 @@ static bool build_config_fields(const char *args, char *out, size_t cap)
             char mode[16];
             memcpy(mode, start, len);
             mode[len] = '\0';
-            if (strcasecmp(mode, "listen") != 0 &&
-                strcasecmp(mode, "listen_only") != 0 &&
-                strcasecmp(mode, "normal") != 0 &&
-                strcasecmp(mode, "selftest") != 0 &&
-                strcasecmp(mode, "no_ack") != 0) {
+            if (!linsight_mode_valid(mode)) {
                 return false;
             }
             const int n = snprintf(out + used, cap - used, "%s\"mode\":\"%s\"",
@@ -1258,7 +1253,7 @@ static size_t build_stats_json(char *out, size_t cap)
 
     const int n = snprintf(
         out, cap,
-        "{\"version\":\"0.4.0\",\"device\":%s,\"device_id\":\"%s\",\"boot\":%u,"
+        "{\"version\":\"" LINSIGHT_HOST_VERSION "\",\"device\":%s,\"device_id\":\"%s\",\"boot\":%u,"
         "\"records\":%llu,\"recv_raw\":%llu,\"backlog_skipped\":%llu,"
         "\"seq_gaps\":%llu,\"seq_missing\":%llu,\"seq_ambiguous\":%llu,"
         "\"written\":%llu,\"dropped\":%llu,\"log\":\"%s\",\"log_error\":\"%s\","
@@ -1344,7 +1339,7 @@ static void cli_dispatch(cli_conn_t *c)
             char *end = NULL;
             const unsigned long ms = strtoul(lease + 6, &end, 10);
             if (end == lease + 6 || (*end && *end != ' ') ||
-                ms < LINSIGHT_PAUSE_LEASE_MIN_MS || ms > LINSIGHT_PAUSE_LEASE_MAX_MS) {
+                !linsight_pause_lease_valid(ms)) {
                 cli_reply(c, "ERR bad lease\n");
                 return;
             }

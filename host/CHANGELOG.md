@@ -16,6 +16,8 @@
   wrap `usbipd attach`, `modprobe peak_usb`, bitrate configuration and
   `ip link set can0 up`, with `--status` for diagnostics.
 - Regression suite: 14 CTest entries, including offline tool and CLI checks.
+- Share control-command validation and the host version between the daemon and
+  the CLI; build common and offline sources as static libraries.
 
 ## v0.3.0 — 2026-11-08
 

@@ -23,7 +23,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -33,13 +32,13 @@
 
 #include "canlog.h"
 #include "compare.h"
+#include "ctl_proto.h"
 #include "dbc.h"
 #include "import.h"
 #include "replay.h"
 
 #define DEFAULT_CTL "/tmp/linsight.sock"
 #define SYSTEM_CTL "/run/linsight/ctl.sock"
-#define CLI_VERSION "0.3.0"
 #define REPLY_MAX 4096
 
 static const char *g_ctl;
@@ -396,8 +395,7 @@ static int cmd_config(int argc, char **argv)
         if (strcmp(argv[i], "--bitrate") == 0 && i + 1 < argc) {
             char *end = NULL;
             const long v = strtol(argv[++i], &end, 10);
-            if (end == argv[i] || *end != '\0' ||
-                (v != 125000 && v != 250000 && v != 500000 && v != 1000000)) {
+            if (end == argv[i] || *end != '\0' || !linsight_bitrate_valid(v)) {
                 fprintf(stderr,
                         "linsight-cli: --bitrate must be 125000, 250000, 500000 or 1000000\n");
                 return 1;
@@ -406,12 +404,10 @@ static int cmd_config(int argc, char **argv)
             any = true;
         } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             const char *mode = argv[++i];
-            if (strcasecmp(mode, "listen") != 0 &&
-                strcasecmp(mode, "listen_only") != 0 &&
-                strcasecmp(mode, "normal") != 0 &&
-                strcasecmp(mode, "selftest") != 0 &&
-                strcasecmp(mode, "no_ack") != 0) {
-                fprintf(stderr, "linsight-cli: --mode must be listen|normal|selftest\n");
+            if (!linsight_mode_valid(mode)) {
+                fprintf(stderr,
+                        "linsight-cli: --mode must be "
+                        "listen|listen_only|normal|selftest|no_ack\n");
                 return 1;
             }
             n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, " mode=%s", mode);
@@ -730,7 +726,8 @@ static int cmd_pause(int argc, char **argv)
     bool has_lease = false;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--lease") == 0 && i + 1 < argc) {
-            if (!parse_u32(argv[++i], 1800000u, &lease) || lease < 5000) {
+            if (!parse_u32(argv[++i], LINSIGHT_PAUSE_LEASE_MAX_MS, &lease) ||
+                !linsight_pause_lease_valid(lease)) {
                 fprintf(stderr, "linsight-cli: --lease must be 5000..1800000 ms\n");
                 return 1;
             }
@@ -800,7 +797,7 @@ int main(int argc, char **argv)
         return 1;
     }
     if (g_version) {
-        puts("linsight-cli " CLI_VERSION);
+        puts("linsight-cli " LINSIGHT_HOST_VERSION);
         return 0;
     }
     if (!g_ctl) {
