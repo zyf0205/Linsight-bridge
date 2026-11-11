@@ -13,6 +13,7 @@ Layout:
 - `host/cli/` — stats/live/config/pause/resume/clear/export/replay/compare/decode
 - `ros2_ws/src/linsight_ros2/` — ROS 2 Humble bridge (vcan → `/can_rx`, `/linsight/stats`)
 - `host/systemd/` — service unit + `/etc/default` args (CMake `install` targets)
+- `docs/commands.md` — 常用命令速查（中文，服务 / CLI / vcan / ROS 2）
 - `host/tests/` — record/parser/fuzz/ring/canlog/compare/dbc/session/export/import/integration/rotation
 - `protocol/` — shared v2.1 parser (mirror of the firmware repo)
 - `firmware/can_ring.c/h` — read-only copy of the firmware ring for `test_ring`
@@ -20,7 +21,7 @@ Layout:
 - `tools/bench_can.py` — optional python-can bench tool; `cangen` is the primary bench
 - `tools/can_soak.py` — AF_CAN 32-bit-counter generator + `.lsc` verifier
 - `tools/soak24h.py` — self-contained daemon + generator + health samples + report
-- `docs/` — project docs mirrored from the firmware repo
+- `docs/` — project docs (source of truth); the firmware repo keeps a `hardware.md` copy
 
 ## Commands
 
