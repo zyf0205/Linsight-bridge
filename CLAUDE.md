@@ -54,7 +54,7 @@ Both `linsightd` and the node need `CAP_NET_RAW` (run with sudo in WSL).
 `config` exits 0 on ACK OK, 2 on BAD_ARG, 3 on FAILED. `compare` exits 1 when
 missing/extra/order are non-zero.
 
-Bench (PCAN via usbipd; the Windows GUI is legacy/removed):
+Bench (PCAN via usbipd; the Windows GUI lives in the firmware repo as `tools/can_gui.py`):
 ```bash
 ../tools/can-up.sh [BUSID] [BITRATE]   # attach + modprobe + bitrate + link up
 ../tools/can-up.sh --status            # Windows + WSL state, no changes
