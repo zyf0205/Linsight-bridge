@@ -76,11 +76,13 @@ typedef struct {
     uint64_t to_wall;
 } lsc_filter_t;
 
-/* Exports. Both return the number of frames written, or -1. */
+/* Exports. All return the number of frames written, or -1. */
 long canlog_export_asc_filtered(const char *lsc_path, const char *out_path,
                                 const lsc_filter_t *filter);
 long canlog_export_candump_filtered(const char *lsc_path, const char *out_path,
                                     const lsc_filter_t *filter);
+long canlog_export_csv_filtered(const char *lsc_path, const char *out_path,
+                                const lsc_filter_t *filter);
 
 /* Format one record as a candump line using the given session start time.
  * Returns the string length, or -1 when buf is too small. */

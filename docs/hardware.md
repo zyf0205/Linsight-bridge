@@ -1,6 +1,6 @@
 # LinSight 硬件
 
-> 立创·实战派 ESP32-S3（无电池 / 无摄像头）；来源：官方 wiki + `08-lcd_lvgl` BSP。更新：2026-11-08。
+> 立创·实战派 ESP32-S3（无电池 / 无摄像头）；来源：官方 wiki + `08-lcd_lvgl` BSP。更新：2026-11-13。
 
 ## 1. 板卡
 
@@ -28,7 +28,7 @@
 | 43 / 44 | UART0 TX / RX | CH340K |
 
 - 除扩展口外没有引出其他 GPIO（GPIO12、22–25 需焊测试点）；所有 IO 为 **3.3V，不耐 5V**。
-- TF 卡：板载 1-bit SDMMC（CLK/CMD/D0 = 47/48/21），无卡检测脚；FAT32、8.3 名 `recNNNNN.lsc`，每 5 s 重试挂载。
+- TF 卡：板载 1-bit SDMMC（CLK/CMD/D0 = 47/48/21），无卡检测脚；FAT32、8.3 名 `recNNNNN.lsc`，每 5 s 重试挂载。日志是二进制，挂载时写入的 `README.TXT` 给出上位机 `linsight-cli report` / `export csv` 转换命令。
 
 ## 3. 显示与触摸
 
@@ -94,10 +94,12 @@ USB-CAN            CAN_H ── 收发器 CANH
 
 - 高速连续发送会让部分 PCAN-USB 假活（`CAN_Write` OK、status 0x0，回显/上行停摆）；
   软复位无效，只能拔插或管理员 `pnputil /restart-device`。
-- 台架改用 **WSL2 SocketCAN**：管理员 `usbipd bind --busid 2-1` 一次；每次拔插/WSL 重启后 `usbipd attach --wsl --busid 2-1`。WSL 内 `sudo modprobe peak_usb`、
-  `sudo ip link set can0 type can bitrate 500000 && sudo ip link set can0 up`；
-  `cangen can0 -n 500 -g 20 -I 0x123 -L 8` 发帧，以设备 `total` 为判据（不依赖回显）。
-  实测 50 fps/10 s +500；PCAN-USB 经 usbip 约 1 ms/帧，持续上限约 830–920 fps，`missed/rxq_full/dropped` 全 0。
+- 台架改用 **WSL2 SocketCAN**：Windows 侧 `python tools/can_gui.py`（自动 `usbipd attach`、`modprobe peak_usb`、配置 `can0`，
+  含切速率 / 发帧 / 监听 / TX·RX 统计；首次或换 USB 口需管理员 bind，程序自动弹 UAC）。主机仓库一键脚本：
+  `tools/can-up.sh [BUSID] [BITRATE]`、`tools/can-down.sh --status`。手动等价：`usbipd bind/attach --wsl --busid <id>`，
+  WSL 内 `sudo modprobe peak_usb`、`sudo ip link set can0 type can bitrate 500000 restart-ms 100 && sudo ip link set can0 up`，
+  `cangen can0 -n 500 -g 20 -I 0x123 -L 8` 发帧，以设备 `total` 为判据（不依赖回显）。实测 50 fps/10 s +500；
+  PCAN-USB 经 usbip 约 1 ms/帧，持续上限约 830–920 fps，`missed/rxq_full/dropped` 全 0。
 
 ## 6. sdkconfig 必改
 

@@ -220,6 +220,7 @@ typedef struct {
     const lsc_filter_t *filter;
     long count;
     bool asc; /* write the Vector ASC header/footer */
+    bool csv; /* write the CSV column header */
 } export_ctx_t;
 
 static bool export_match(const linsight_can_record_t *r, const export_ctx_t *e)
@@ -286,6 +287,29 @@ static void export_candump_cb(const linsight_can_record_t *r, void *ctx)
     }
 }
 
+/* Plain CSV for Excel/pandas: one row per frame, data as continuous hex. */
+static void export_csv_cb(const linsight_can_record_t *r, void *ctx)
+{
+    export_ctx_t *e = ctx;
+    if (!export_match(r, e)) {
+        return;
+    }
+    const uint64_t wall_ms = e->start_wall_ms + (uint64_t)r->ts_ms;
+    const bool ext = (r->flags & LINSIGHT_REC_FLAG_EXT) != 0;
+    const bool rtr = (r->flags & LINSIGHT_REC_FLAG_RTR) != 0;
+
+    fprintf(e->out, "%llu,%u,%u,0x%X,%u,%u,%u,",
+            (unsigned long long)wall_ms, (unsigned)r->ts_ms, (unsigned)r->seq,
+            (unsigned)r->id, ext ? 1u : 0u, rtr ? 1u : 0u, (unsigned)r->dlc);
+    if (!rtr) {
+        for (uint32_t i = 0; i < r->dlc && i < LINSIGHT_DLC_MAX; i++) {
+            fprintf(e->out, "%02X", r->data[i]);
+        }
+    }
+    fputc('\n', e->out);
+    e->count++;
+}
+
 static long export_common(const char *lsc_path, const char *out_path, lsc_record_cb cb,
                           const lsc_filter_t *filter)
 {
@@ -303,6 +327,7 @@ static long export_common(const char *lsc_path, const char *out_path, lsc_record
         .start_wall_ms = rd.start_wall_ms,
         .filter = filter,
         .asc = cb == export_asc_cb,
+        .csv = cb == export_csv_cb,
     };
     e.out = (strcmp(out_path, "-") == 0) ? stdout : fopen(out_path, "w");
     if (!e.out) {
@@ -324,6 +349,9 @@ static long export_common(const char *lsc_path, const char *out_path, lsc_record
         fprintf(e.out, "// version 9.0.0\n");
         fprintf(e.out, "Begin Triggerblock %s\n", date);
         fprintf(e.out, "   0.000000 Start of measurement\n");
+    }
+    if (e.csv) {
+        fputs("wall_ms,uptime_ms,seq,id,ext,rtr,dlc,data_hex\n", e.out);
     }
 
     linsight_can_record_t rec;
@@ -351,6 +379,12 @@ long canlog_export_candump_filtered(const char *lsc_path, const char *out_path,
                                     const lsc_filter_t *filter)
 {
     return export_common(lsc_path, out_path, export_candump_cb, filter);
+}
+
+long canlog_export_csv_filtered(const char *lsc_path, const char *out_path,
+                                const lsc_filter_t *filter)
+{
+    return export_common(lsc_path, out_path, export_csv_cb, filter);
 }
 
 int canlog_format_candump_ms(const linsight_can_record_t *r, uint64_t start_wall_ms, char *buf,

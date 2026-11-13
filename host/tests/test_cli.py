@@ -57,6 +57,26 @@ class CliTests(unittest.TestCase):
                     proc.kill()
                 proc.communicate()
 
+    def test_report_writes_html_and_refuses_input_path(self):
+        with tempfile.TemporaryDirectory(prefix="linsight-cli-test-") as tmp:
+            lsc = Path(tmp) / "empty.lsc"
+            lsc.write_bytes(struct.pack("<4sHIIHQII", b"LSC1", 1, 500000, 0, 0,
+                                        1760000000, 0, 0))
+            out = Path(tmp) / "report.html"
+            result = subprocess.run([CLI, "report", str(lsc), "-o", str(out),
+                                     "--title", "CLI report"], capture_output=True,
+                                    text=True, timeout=3)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("report: 0 frames, 0 IDs", result.stdout)
+            html = out.read_text()
+            self.assertIn("<title>CLI report</title>", html)
+            self.assertIn("No records in this log.", html)
+
+            result = subprocess.run([CLI, "report", str(lsc), "-o", str(lsc)],
+                                    capture_output=True, text=True, timeout=3)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("report failed", result.stderr)
+
     def test_verify_failure_prints_initialized_stats(self):
         with tempfile.TemporaryDirectory(prefix="linsight-cli-test-") as tmp:
             invalid = Path(tmp) / "bad.lsc"

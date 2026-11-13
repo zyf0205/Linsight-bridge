@@ -9,19 +9,16 @@ ctest suite. The ESP32-S3 firmware, Wi-Fi credentials, and flashing live in the 
 Windows checkout `D:\_study\projects\_MyProject\LinSight`; this repo does not build firmware.
 
 Layout:
-- `host/src/` — daemon, `.lsc` writer/reader, replay, compare, DBC, device session, SocketCAN forward
-- `host/cli/` — stats/live/config/pause/resume/clear/export/replay/compare/decode
+- `host/src/` — daemon, `.lsc` writer/reader, replay, compare, DBC, HTML report, device session, SocketCAN forward
+- `host/cli/` — stats/live/config/pause/resume/clear/export/report/replay/compare/decode
 - `ros2_ws/src/linsight_ros2/` — ROS 2 Humble bridge (vcan → `/can_rx`, `/linsight/stats`)
 - `host/systemd/` — service unit + `/etc/default` args (CMake `install` targets)
-- `docs/commands.md` — 常用命令速查（中文，服务 / CLI / vcan / ROS 2）
-- `host/tests/` — record/parser/fuzz/ring/canlog/compare/dbc/session/export/import/integration/rotation
+- `host/tests/` — record/parser/fuzz/ring/canlog/compare/dbc/session/export/import/report/integration/rotation
 - `protocol/` — shared v2.1 parser (mirror of the firmware repo)
 - `firmware/can_ring.c/h` — read-only copy of the firmware ring for `test_ring`
 - `tools/can-up.sh` / `can-down.sh` — one-shot usbipd + peak_usb + can0 bring-up/teardown
-- `tools/bench_can.py` — optional python-can bench tool; `cangen` is the primary bench
 - `tools/can_soak.py` — AF_CAN 32-bit-counter generator + `.lsc` verifier
-- `tools/soak24h.py` — self-contained daemon + generator + health samples + report
-- `docs/` — project docs (source of truth); the firmware repo keeps a `hardware.md` copy
+- `host/README.md` — build, CLI, service and bench reference; `docs/hardware.md` is the shared hardware doc
 
 ## Commands
 
@@ -37,8 +34,9 @@ build/linsight-cli stats [--watch] [--interval MS]
 build/linsight-cli live [--id 0x123] [--ext|--std] [--color]
 build/linsight-cli config --bitrate 500000 --mode normal
 build/linsight-cli pause|resume|clear
-build/linsight-cli export candump FILE.lsc [-o OUT] [--id ID] [--ext|--std]
+build/linsight-cli export asc|candump|csv FILE.lsc [-o OUT] [--id ID] [--ext|--std]
                                      [--from EPOCH] [--to EPOCH]
+build/linsight-cli report FILE.lsc [-o report.html] [--title TEXT]
 build/linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]
 build/linsight-cli compare REF.lsc CAND.lsc
 build/linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]
@@ -46,7 +44,7 @@ build/linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]
 sudo cmake --install build        # binaries + unit + prefix etc/default
 python3 ../tools/can_soak.py --iface can0 --rate 1000 --duration 600 --record /tmp/tx.csv
 python3 ../tools/can_soak.py --verify FILE.lsc --expect 600000
-python3 ../tools/soak24h.py --duration 86400 --rate 800   # report in ~/can-logs/soak-latest
+build/linsight-cli report FILE.lsc -o report.html          # self-contained HTML
 ```
 
 SocketCAN/ROS 2: `--vcan vcan0` forwards accepted records to SocketCAN; the
@@ -76,9 +74,11 @@ cangen can0 -n 500 -g 20 -I 0x123 -L 8 # 50 fps x 10 s; device total is ground t
 - `--vcan IFACE`: after dedupe, records are written nonblocking as `struct can_frame`
   to SocketCAN; `CAN_EFF_FLAG`/`CAN_RTR_FLAG`/`CAN_ERR_FLAG` are mapped and drops are
   counted, never blocking the epoll loop.
-- `linsight-cli`: control commands use the Unix socket; `export`/`replay`/`compare` read
-  files directly and work without a running daemon. `live` is newline-framed candump text.
-  `config` sends only explicit fields and waits for the device ACK.
+- `linsight-cli`: control commands use the Unix socket; `export`/`report`/`replay`/`compare`
+  read files directly and work without a running daemon. `live` is newline-framed candump
+  text. `config` sends only explicit fields and waits for the device ACK. `report` emits a
+  standalone HTML page (tiles, SVG FPS timeline, top-ID table, session metadata); `export
+  csv` is the spreadsheet path for SD black-box captures.
 - `.lsc` reader takes a record-count snapshot at open, so replaying the daemon's current
   log terminates instead of following the growing file. Truncated tail records are EOF.
 - `replay` uses `AF_CAN`/`CAN_RAW` and `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`;

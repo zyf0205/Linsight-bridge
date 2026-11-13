@@ -6,8 +6,9 @@
  *   linsight-cli config [--bitrate 125000|250000|500000|1000000]
  *                       [--mode listen|normal|selftest]
  *   linsight-cli pause | resume | clear
- *   linsight-cli export asc|candump FILE.lsc [-o OUT]
+ *   linsight-cli export asc|candump|csv FILE.lsc [-o OUT]
  *                       [--id ID] [--ext|--std] [--from EPOCH] [--to EPOCH]
+ *   linsight-cli report FILE.lsc [-o report.html] [--title TEXT]
  *   linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]
  *   linsight-cli compare REF.lsc CAND.lsc
  *   linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]
@@ -36,6 +37,7 @@
 #include "dbc.h"
 #include "import.h"
 #include "replay.h"
+#include "report.h"
 
 #define DEFAULT_CTL "/tmp/linsight.sock"
 #define SYSTEM_CTL "/run/linsight/ctl.sock"
@@ -53,8 +55,9 @@ static void usage(void)
             "       linsight-cli live [--id ID] [--ext|--std] [--color]\n"
             "       linsight-cli config [--bitrate N] [--mode listen|normal|selftest]\n"
             "       linsight-cli pause [--lease MS] | resume | clear\n"
-            "       linsight-cli export asc|candump FILE.lsc [-o OUT]\n"
+            "       linsight-cli export asc|candump|csv FILE.lsc [-o OUT]\n"
             "                         [--id ID] [--ext|--std] [--from EPOCH] [--to EPOCH]\n"
+            "       linsight-cli report FILE.lsc [-o report.html] [--title TEXT]\n"
             "       linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]\n"
             "       linsight-cli compare REF.lsc CAND.lsc\n"
             "       linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]\n"
@@ -487,8 +490,10 @@ static int cmd_export(int argc, char **argv)
         n = canlog_export_asc_filtered(lsc, out, &filter);
     } else if (strcmp(fmt, "candump") == 0) {
         n = canlog_export_candump_filtered(lsc, out, &filter);
+    } else if (strcmp(fmt, "csv") == 0) {
+        n = canlog_export_csv_filtered(lsc, out, &filter);
     } else {
-        fprintf(stderr, "linsight-cli: unknown format '%s' (asc|candump)\n", fmt);
+        fprintf(stderr, "linsight-cli: unknown format '%s' (asc|candump|csv)\n", fmt);
         return 1;
     }
     if (n < 0) {
@@ -720,6 +725,41 @@ static int cmd_verify(int argc, char **argv)
     return rc;
 }
 
+static int cmd_report(int argc, char **argv)
+{
+    if (argc < 3) {
+        usage();
+        return 1;
+    }
+    const char *lsc = argv[2];
+    const char *out = "-";
+    const char *title = NULL;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+            out = argv[++i];
+        } else if (strcmp(argv[i], "--title") == 0 && i + 1 < argc) {
+            title = argv[++i];
+        } else {
+            usage();
+            return 1;
+        }
+    }
+
+    lsc_report_info_t info = {0};
+    errno = 0;
+    if (lsc_report_html(lsc, out, title, &info) != 0) {
+        fprintf(stderr, "linsight-cli: report failed: %s\n",
+                errno ? strerror(errno) : "bad .lsc file");
+        return 1;
+    }
+    if (strcmp(out, "-") != 0) {
+        printf("report: %llu frames, %llu IDs -> %s\n",
+               (unsigned long long)info.frames,
+               (unsigned long long)info.unique_ids, out);
+    }
+    return 0;
+}
+
 static int cmd_pause(int argc, char **argv)
 {
     uint32_t lease = 0;
@@ -836,6 +876,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "decode") == 0) {
         return cmd_decode(argc, argv);
+    }
+    if (strcmp(cmd, "report") == 0) {
+        return cmd_report(argc, argv);
     }
     if (strcmp(cmd, "import") == 0) {
         return cmd_import(argc, argv);

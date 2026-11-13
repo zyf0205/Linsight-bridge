@@ -27,7 +27,8 @@ add_library(linsight_offline STATIC
     src/compare.c
     src/dbc.c
     src/replay.c
-    src/import.c)
+    src/import.c
+    src/report.c)
 target_link_libraries(linsight_offline PUBLIC linsight_core)
 
 # linsightd: epoll daemon, .lsc writer thread, Unix-socket control
@@ -64,6 +65,8 @@ add_executable(test_export tests/test_export.c)
 target_link_libraries(test_export PRIVATE linsight_core)
 add_executable(test_import tests/test_import.c)
 target_link_libraries(test_import PRIVATE linsight_offline)
+add_executable(test_report tests/test_report.c)
+target_link_libraries(test_report PRIVATE linsight_offline)
 
 add_test(NAME record COMMAND test_record)
 add_test(NAME parser COMMAND test_parser)
@@ -75,6 +78,7 @@ add_test(NAME dbc COMMAND test_dbc)
 add_test(NAME session COMMAND test_session)
 add_test(NAME export COMMAND test_export)
 add_test(NAME import COMMAND test_import)
+add_test(NAME report COMMAND test_report)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)

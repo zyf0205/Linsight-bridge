@@ -29,8 +29,6 @@ def load_tool(name):
 
 
 can_soak = load_tool("can_soak")
-with mock.patch.dict(sys.modules, {"can_soak": can_soak}):
-    soak24h = load_tool("soak24h")
 
 
 def header(version=1):
@@ -88,26 +86,6 @@ class ToolTests(unittest.TestCase):
         result = can_soak.verify_file(path, 0x123, ext=True, first=0xFFFFFFFF, expect=2)
         self.assertEqual(result["next"], 1)
         self.assertEqual(can_soak.build_frame(0x100000000, 0x123)[8:12], bytes(4))
-
-    def test_parts_use_matched_offset_and_require_sent_evidence(self):
-        self.write("can-20261109-120000-001.lsc", header() + record(0, ident=0x456) + record(0))
-        self.write("can-20261109-120000-001-p001.lsc", header() + record(1))
-        out = self.root / "verify.log"
-        self.assertEqual(soak24h.verify_parts(self.root, "0x123", out, 2), (True, 2, 2))
-        self.assertFalse(soak24h.verify_parts(self.root, "0x123", out, 3)[0])
-        self.assertFalse(soak24h.verify_parts(self.root, "0x123", out)[0])
-        self.write("can-20261109-120000-001-p002.lsc", b"LSC1")
-        self.assertFalse(soak24h.verify_parts(self.root, "0x123", out, 2)[0])
-
-    def test_numeric_part_order_and_generator_result(self):
-        paths = [str(self.root / f"can-20261109-120000-001-p{n}.lsc") for n in (1000, 999, 2)]
-        self.assertEqual(sorted(paths, key=soak24h.log_part_key), paths[::-1])
-        path = self.write("generator.log", b"done: sent=3\n")
-        self.assertIsNone(soak24h.generator_sent(path))
-        path.write_text('result: {"sent":3,"errors":0,"completed":true}\n')
-        self.assertEqual(soak24h.generator_sent(path), 3)
-        path.write_text('result: {"sent":false}\n')
-        self.assertIsNone(soak24h.generator_sent(path))
 
     def test_generator_emits_actual_sent_result_without_can(self):
         fake_socket = mock.Mock()

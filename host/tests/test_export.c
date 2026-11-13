@@ -92,12 +92,26 @@ int main(void)
     CHECK(strstr(text, "End Triggerblock\n") != NULL);
     free(text);
 
+    char csv[] = "/tmp/linsight-export-csv-XXXXXX";
+    const int cfd = mkstemp(csv);
+    CHECK(cfd >= 0);
+    close(cfd);
+    CHECK(canlog_export_csv_filtered(path, csv, NULL) == 3);
+    text = read_file(csv);
+    CHECK(strstr(text, "wall_ms,uptime_ms,seq,id,ext,rtr,dlc,data_hex\n") != NULL);
+    CHECK(strstr(text, "1700000001500,1500,1,0x123,0,0,2,1122\n") != NULL);
+    CHECK(strstr(text, "1700000001600,1600,2,0x18DAF110,1,0,2,1122\n") != NULL);
+    CHECK(strstr(text, "1700000001700,1700,3,0x321,0,1,3,\n") != NULL);
+    free(text);
+
     /* Refuse to overwrite the input file. */
     CHECK(canlog_export_candump_filtered(path, path, NULL) == -1);
+    CHECK(canlog_export_csv_filtered(path, path, NULL) == -1);
 
     unlink(path);
     unlink(dump);
     unlink(asc);
+    unlink(csv);
     puts("export: ok");
     return 0;
 }

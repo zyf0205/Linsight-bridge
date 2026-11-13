@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 — 2026-11-13
 
 - Remove the HTTP/SSE dashboard; add optional `--vcan` SocketCAN forwarding for
   the ROS 2 Humble bridge, a 262144-record writer ring and 1 Hz `fdatasync`.
@@ -15,7 +15,13 @@
 - One-shot USB-CAN bench bring-up: `tools/can-up.sh` / `tools/can-down.sh`
   wrap `usbipd attach`, `modprobe peak_usb`, bitrate configuration and
   `ip link set can0 up`, with `--status` for diagnostics.
-- Regression suite: 14 CTest entries, including offline tool and CLI checks.
+- `linsight-cli report FILE.lsc` writes a self-contained HTML report (stat
+  tiles, SVG frames-per-second timeline, top-ID table, session metadata);
+  `export csv` adds a spreadsheet-friendly dump. Both work directly on SD
+  black-box captures, and the card carries a `README.TXT` with the commands.
+- Remove the redundant `tools/bench_can.py` and `tools/soak24h.py`; `cangen`
+  and `can_soak.py` cover bench generation and counter-checked soaks.
+- Regression suite: 15 CTest entries, including offline tool, report and CLI checks.
 - Share control-command validation and the host version between the daemon and
   the CLI; build common and offline sources as static libraries.
 

@@ -15,13 +15,13 @@ device ──Wi-Fi/TCP── linsightd ── .lsc writer thread
 ```bash
 cd host
 cmake -S . -B build && cmake --build build -j"$(nproc)"
-ctest --test-dir build --output-on-failure        # 14 tests
+ctest --test-dir build --output-on-failure        # 15 tests
 cmake -S . -B build-asan -DLINSIGHT_SANITIZE=ON   # ASan/UBSan
 ```
 
 Tests cover the shared parser (including fuzz), record layout, the firmware ring
-drop-oldest policy, `.lsc` reader snapshots, HELLO anchoring/dedupe, candump/ASC
-export shape, SD-style import/verify, `compare`, and two
+drop-oldest policy, `.lsc` reader snapshots, HELLO anchoring/dedupe, candump/ASC/CSV
+export shape, HTML reports, SD-style import/verify, `compare`, and two
 end-to-end daemon tests:
 device→CLI/log and size-based log rotation.
 
@@ -51,8 +51,9 @@ build/linsight-cli stats [--watch] [--interval MS]
 build/linsight-cli live [--id 0x123] [--ext|--std] [--color]
 build/linsight-cli config --bitrate 500000 --mode normal   # waits for device ACK
 build/linsight-cli pause [--lease MS] | resume | clear
-build/linsight-cli export candump FILE.lsc [-o OUT] [--id ID] [--ext|--std]
+build/linsight-cli export asc|candump|csv FILE.lsc [-o OUT] [--id ID] [--ext|--std]
                                      [--from EPOCH] [--to EPOCH]
+build/linsight-cli report FILE.lsc [-o report.html] [--title TEXT]
 build/linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]
 build/linsight-cli compare REF.lsc CAND.lsc
 build/linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]
@@ -74,6 +75,14 @@ every matching frame.
 `--boot-wall` for an exact epoch, or the CLI uses `mtime - last_ts_ms` and
 prints a warning. `verify` checks the header, record length, time order and
 sequence gaps; `--strict` makes a truncated tail or any gap a failure.
+
+`report` turns a `.lsc` into one self-contained HTML page: frame/duration/ID
+tiles, an SVG frames-per-second timeline, the top 12 IDs with share bars, and
+session metadata. It needs no daemon or browser assets, so an SD `recNNNNN.lsc`
+can be copied off the card and reported directly; run `import` first if you
+need wall-clock stamps instead of uptime, and `-o -` writes to stdout.
+`export csv` emits `wall_ms,uptime_ms,seq,id,ext,rtr,dlc,data_hex` for Excel
+or pandas. A `README.TXT` on the SD card points at these commands.
 
 ## SocketCAN / ROS 2
 
@@ -131,10 +140,5 @@ build/linsight-cli stats --watch
 
 For counter-checked soaks use `../tools/can_soak.py` (AF_CAN generator, 32-bit
 payload counter) and compare the captured `.lsc` against the send sequence.
-`../tools/soak24h.py` wraps a private daemon, the generator, one-minute health
-samples and per-part verification into one long run:
-
-```bash
-python3 ../tools/soak24h.py --duration 86400 --rate 800
-# report: ~/can-logs/soak-latest/summary.txt; stop via soak-latest/wrapper.pid
-```
+With a daemon already running, start the generator with `--record` for a short
+run, or wrap the same command in a shell loop for longer soaks.

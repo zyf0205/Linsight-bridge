@@ -1,7 +1,7 @@
 #pragma once
 
 /*
- * LinSight wire protocol v2.0 (CAN analyzer), shared by the ESP32-S3 device
+ * LinSight wire protocol v2.1 (CAN analyzer), shared by the ESP32-S3 device
  * and the Linux host.
  *
  * This file is intentionally free of ESP-IDF, POSIX and libc-allocation
