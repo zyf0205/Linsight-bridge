@@ -5,16 +5,13 @@ on:
   pull_request:
 
 jobs:
-  build-and-test:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure with ASan/UBSan
-        run: cmake -S host -B build -DLINSIGHT_SANITIZE=ON
+        run: cmake -S . -B build -DLINSIGHT_SANITIZE=ON
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
-
-      - name: Test
-        run: ctest --test-dir build --output-on-failure

@@ -1,5 +1,0 @@
-# Arguments for linsightd.service (read by EnvironmentFile=-/etc/default/linsightd).
-# Add --vcan vcan0 to forward frames to SocketCAN (needs CAP_NET_RAW).
-# Add --dump /path/to/cap.log (or --dump -) for a candump text stream.
-# --pace SPEED / --pace-replay control vcan pacing (see linsightd --help).
-LINSIGHTD_ARGS=--port 8888

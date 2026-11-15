@@ -11,7 +11,7 @@
  * queue never plays catch-up with sleeps.
  *
  * All state is plain data and now_ns is passed in by the caller, so the
- * module has no POSIX clock dependency and is deterministic to unit-test.
+ * module has no POSIX clock dependency and is deterministic.
  *
  * NOTE: pace_t embeds PACEQ_CAP entries (~8 MiB). Allocate it statically or
  * on the heap, never on the stack.

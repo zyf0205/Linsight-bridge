@@ -7,7 +7,7 @@
  * reconnect backlogs, written as candump text (--dump) and paced onto a
  * SocketCAN interface (--vcan) by their device timestamps, so cycle times in
  * SavvyCAN/PlotJuggler are real. The bridge does not record: the device SD
- * black box (tools/lsc.py) or tcpdump/SavvyCAN own capture.
+ * black box or tcpdump/SavvyCAN own capture.
  */
 
 #include <errno.h>
@@ -168,7 +168,7 @@ static void vcan_forward(const linsight_can_record_t *recs, uint32_t n)
 /* ------------------------------------------------------------ dump output */
 
 /* Byte-compatible with the former canlog_format_candump_ms() so `--dump`
- * lines match `lsc.py export candump` (and can-utils candump) exactly. */
+ * lines match can-utils candump exactly. */
 static int dump_format_line(const linsight_can_record_t *r, uint64_t start_wall_ms,
                             char *buf, size_t cap)
 {
@@ -228,7 +228,7 @@ static void dump_write_records(const linsight_can_record_t *recs, uint32_t n)
     }
     if (n) {
         /* Per-batch flush: --dump behaves like a live stream (candump-like),
-         * and tests can read the file without waiting for the 1 Hz tick. */
+         * so readers see lines without waiting for the 1 Hz tick. */
         fflush(g_dump);
     }
 }
