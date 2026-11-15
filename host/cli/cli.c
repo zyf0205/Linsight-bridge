@@ -11,10 +11,11 @@
  *   linsight-cli report FILE.lsc [-o report.html] [--title TEXT]
  *   linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]
  *   linsight-cli compare REF.lsc CAND.lsc
- *   linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]
  *
- * All commands use the daemon's control socket; `export`, `replay`, `compare`
- * and `decode` read files directly and therefore work without a running daemon.
+ * All commands use the daemon's control socket; `export`, `report`, `replay`,
+ * `compare`, `import` and `verify` read files directly and therefore work
+ * without a running daemon. Signal decoding stays with ecosystem tools
+ * (e.g. SavvyCAN) fed by `export asc|candump|csv`.
  */
 
 #include <errno.h>
@@ -34,7 +35,6 @@
 #include "canlog.h"
 #include "compare.h"
 #include "ctl_proto.h"
-#include "dbc.h"
 #include "import.h"
 #include "replay.h"
 #include "report.h"
@@ -60,7 +60,6 @@ static void usage(void)
             "       linsight-cli report FILE.lsc [-o report.html] [--title TEXT]\n"
             "       linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]\n"
             "       linsight-cli compare REF.lsc CAND.lsc\n"
-            "       linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]\n"
             "       linsight-cli import FILE.lsc -o OUT.lsc [--boot-wall EPOCH]\n"
             "       linsight-cli verify FILE.lsc [--strict]\n"
             "       global: --ctl PATH | --ctl-port PORT | --version\n"
@@ -484,6 +483,18 @@ static int cmd_export(int argc, char **argv)
         fprintf(stderr, "linsight-cli: --to must be greater than --from\n");
         return 1;
     }
+    if (filter.from_valid || filter.to_valid) {
+        lsc_reader_t rd;
+        if (lsc_reader_open(&rd, lsc) == 0) {
+            const bool anchored = rd.wall_valid;
+            lsc_reader_close(&rd);
+            if (!anchored) {
+                fprintf(stderr, "linsight-cli: --from/--to need wall-clock timestamps; "
+                                "run 'linsight-cli import' to anchor the file first\n");
+                return 1;
+            }
+        }
+    }
 
     long n;
     if (strcmp(fmt, "asc") == 0) {
@@ -541,106 +552,6 @@ static int cmd_replay(int argc, char **argv)
     printf("replay: %llu frames on %s in %.3f s (%.2fx), late p99 %.2f ms, max %.2f ms\n",
            (unsigned long long)st.frames, iface, (double)st.elapsed_ns / 1e9, speed,
            (double)st.late_p99_ns / 1e6, (double)st.late_max_ns / 1e6);
-    return 0;
-}
-
-static int cmd_decode(int argc, char **argv)
-{
-    if (argc < 3) {
-        usage();
-        return 1;
-    }
-    const char *lsc = argv[2];
-    const char *dbc_path = NULL;
-    long limit = 100; /* 0 = unlimited */
-    bool id_valid = false;
-    uint32_t want_id = 0;
-
-    for (int i = 3; i < argc; i++) {
-        if (strcmp(argv[i], "--dbc") == 0 && i + 1 < argc) {
-            dbc_path = argv[++i];
-        } else if (strcmp(argv[i], "--id") == 0 && i + 1 < argc) {
-            if (!parse_u32(argv[++i], 0x1FFFFFFFu, &want_id)) {
-                fprintf(stderr, "linsight-cli: bad --id '%s'\n", argv[i]);
-                return 1;
-            }
-            id_valid = true;
-        } else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) {
-            char *end = NULL;
-            const long v = strtol(argv[++i], &end, 10);
-            if (end == argv[i] || *end != '\0' || v < 0) {
-                fprintf(stderr, "linsight-cli: bad --limit '%s'\n", argv[i]);
-                return 1;
-            }
-            limit = v;
-        } else {
-            usage();
-            return 1;
-        }
-    }
-    if (!dbc_path) {
-        fprintf(stderr, "linsight-cli: decode requires --dbc MODEL.dbc\n");
-        return 1;
-    }
-
-    dbc_t *model = calloc(1, sizeof(*model));
-    if (!model) {
-        fprintf(stderr, "linsight-cli: out of memory\n");
-        return 1;
-    }
-    if (dbc_load(model, dbc_path) != 0) {
-        fprintf(stderr, "linsight-cli: cannot read %s: %s\n", dbc_path, strerror(errno));
-        free(model);
-        return 1;
-    }
-
-    lsc_reader_t r;
-    if (lsc_reader_open(&r, lsc) != 0) {
-        fprintf(stderr, "linsight-cli: cannot read %s: %s\n", lsc,
-                errno ? strerror(errno) : "bad .lsc file");
-        free(model);
-        return 1;
-    }
-
-    linsight_can_record_t rec;
-    long total = 0, decoded = 0, unknown = 0, shown = 0;
-    int rc;
-    while ((rc = lsc_reader_next(&r, &rec)) == 1) {
-        total++;
-        if (id_valid && rec.id != want_id) {
-            continue;
-        }
-        const int ext = (rec.flags & LINSIGHT_REC_FLAG_EXT) ? 1 : 0;
-        const dbc_message_t *m = dbc_find(model, rec.id, ext);
-        if (!m) {
-            unknown++;
-            continue;
-        }
-        decoded++;
-        if (limit > 0 && shown >= limit) {
-            continue;
-        }
-        printf("0x%X [%s]", rec.id, m->name);
-        for (size_t s = 0; s < m->signal_count; s++) {
-            const dbc_signal_t *sig = &m->signals[s];
-            double value = 0;
-            if (dbc_decode_signal(sig, rec.data, rec.dlc, &value) == 0) {
-                printf(" %s=%.10g%s%s", sig->name, value, sig->unit[0] ? " " : "",
-                       sig->unit);
-            } else {
-                printf(" %s=--", sig->name);
-            }
-        }
-        printf("\n");
-        shown++;
-    }
-    lsc_reader_close(&r);
-    if (rc < 0) {
-        fprintf(stderr, "linsight-cli: read error in %s\n", lsc);
-    }
-    printf("decode: %ld frames, %ld decoded, %ld unknown, %ld shown\n",
-           total, decoded, unknown, shown);
-    free(model);
     return 0;
 }
 
@@ -873,9 +784,6 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "compare") == 0) {
         return cmd_compare(argc, argv);
-    }
-    if (strcmp(cmd, "decode") == 0) {
-        return cmd_decode(argc, argv);
     }
     if (strcmp(cmd, "report") == 0) {
         return cmd_report(argc, argv);

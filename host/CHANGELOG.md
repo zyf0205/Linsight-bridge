@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.5.0 — 2026-11-15
+
+- Slim the host code: remove the in-house `decode` command and the DBC subset
+  parser (`src/dbc.*`, `tests/test_dbc.c`). Signal decoding belongs to
+  ecosystem tools (SavvyCAN with DBC files, PlotJuggler) fed by `export
+  asc|candump|csv` or `--vcan`; README gains an "Ecosystem tools" recipe
+  table. CLI drops to 12 subcommands, ctest to 14 entries.
+- `replay` maps `LINSIGHT_REC_FLAG_ERR` to `CAN_ERR_FLAG`; error frames used to
+  be replayed as ordinary frames (asymmetric with `--vcan` forwarding).
+- `export --from/--to` rejects uptime-only `.lsc` files (no wall anchor)
+  instead of silently filtering against a pseudo-wall and emitting nothing;
+  the CLI tells the user to run `import` first.
+
 ## v0.4.0 — 2026-11-13
 
 - Remove the HTTP/SSE dashboard; add optional `--vcan` SocketCAN forwarding for

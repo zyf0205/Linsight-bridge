@@ -322,6 +322,13 @@ static long export_common(const char *lsc_path, const char *out_path, lsc_record
     if (lsc_reader_open(&rd, lsc_path) != 0) {
         return -1;
     }
+    /* Time filters are wall-clock epochs; an uptime-only file has no wall
+     * anchor, so filtering would silently match nothing. */
+    if (filter && (filter->from_valid || filter->to_valid) && !rd.wall_valid) {
+        lsc_reader_close(&rd);
+        errno = EINVAL;
+        return -1;
+    }
 
     export_ctx_t e = {
         .start_wall_ms = rd.start_wall_ms,

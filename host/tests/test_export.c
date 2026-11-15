@@ -108,6 +108,24 @@ int main(void)
     CHECK(canlog_export_candump_filtered(path, path, NULL) == -1);
     CHECK(canlog_export_csv_filtered(path, path, NULL) == -1);
 
+    /* Time filters need a wall anchor; uptime-only files must be rejected. */
+    char raw[] = "/tmp/linsight-export-raw-XXXXXX";
+    const int rfd = mkstemp(raw);
+    CHECK(rfd >= 0);
+    close(rfd);
+    const lsc_open_info_t raw_info = {
+        .start_wall_ms = 0,
+        .flags = LSC_FLAG_TS_UPTIME_ONLY,
+    };
+    CHECK(lsc_writer_open_ex(&w, raw, 500000, &raw_info) == 0);
+    make_record(&r, 1, 1500, 0x123, 0, 2);
+    CHECK(lsc_writer_write(&w, &r) == 0);
+    lsc_writer_close(&w);
+    lsc_filter_t tf = {.ext = -1, .from_valid = true, .from_wall = 1700000000ull};
+    CHECK(canlog_export_csv_filtered(raw, dump, &tf) == -1);
+    CHECK(canlog_export_csv_filtered(raw, dump, NULL) == 1);
+    unlink(raw);
+
     unlink(path);
     unlink(dump);
     unlink(asc);

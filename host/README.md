@@ -15,7 +15,7 @@ device ──Wi-Fi/TCP── linsightd ── .lsc writer thread
 ```bash
 cd host
 cmake -S . -B build && cmake --build build -j"$(nproc)"
-ctest --test-dir build --output-on-failure        # 15 tests
+ctest --test-dir build --output-on-failure        # 14 tests
 cmake -S . -B build-asan -DLINSIGHT_SANITIZE=ON   # ASan/UBSan
 ```
 
@@ -56,7 +56,6 @@ build/linsight-cli export asc|candump|csv FILE.lsc [-o OUT] [--id ID] [--ext|--s
 build/linsight-cli report FILE.lsc [-o report.html] [--title TEXT]
 build/linsight-cli replay FILE.lsc [--iface can0] [--speed 1.0]
 build/linsight-cli compare REF.lsc CAND.lsc
-build/linsight-cli decode FILE.lsc --dbc MODEL.dbc [--id ID] [--limit N]
 build/linsight-cli import rec00001.lsc -o can-fixed.lsc [--boot-wall EPOCH]
 build/linsight-cli verify rec00001.lsc [--strict]
 ```
@@ -67,9 +66,7 @@ it exists, then `/tmp/linsight.sock`. Request/reply commands use a 5 s receive
 timeout; `live` subscriptions stay open while idle.
 `config` exits 0 on ACK OK, 2 on `BAD_ARG`, 3 on `FAILED`, 4 when the daemon
 reports an ACK timeout. `compare` exits 1 when missing/extra/order counts are
-non-zero. `decode` supports Intel/Motorola signals with signedness, factor and
-offset; conditional `mN` multiplexed signals are skipped and `--limit 0` prints
-every matching frame.
+non-zero.
 
 `import` re-anchors a black-box log written by the device to wall time: pass
 `--boot-wall` for an exact epoch, or the CLI uses `mtime - last_ts_ms` and
@@ -95,6 +92,25 @@ The minimal ROS 2 Humble package in `../ros2_ws/src/linsight_ros2` reads that
 interface and publishes `/can_rx` (`linsight_ros2/msg/CanFrame`) and a 1 Hz
 `/linsight/stats` (`BusStats`). See its `README_ROS2.md` for vcan setup,
 `colcon build`, permissions and verification.
+
+## Ecosystem tools (analysis front-ends)
+
+LinSight is the recorder and forensics toolbox; interactive decoding and
+plotting are handed to established tools via SocketCAN or file exports. GUI
+tools run under WSLg:
+
+| Need | Tool | Data path |
+|---|---|---|
+| Live trace, DBC decode, signal plots | [SavvyCAN](https://www.savvycan.com/) | SocketCAN on the `--vcan` interface, or File → Import of `export asc/candump/csv` |
+| Quick terminal glance | can-utils | `candump vcan0` (or `linsight-cli live`) |
+| Frame-level forensics | Wireshark | `tcpdump -i vcan0 -w cap.pcapng`, open the capture on Windows |
+| Multi-signal time plots | PlotJuggler | ROS 2 topic `/can_rx` (`ros2 run plotjuggler plotjuggler`) |
+
+```bash
+sudo ip link add vcan0 type vcan && sudo ip link set vcan0 up
+build/linsightd --port 8888 --log-dir ~/can-logs --vcan vcan0  # CAP_NET_RAW
+build/linsight-cli export asc can-*.lsc -o capture.asc         # offline import
+```
 
 ## Install as a service
 

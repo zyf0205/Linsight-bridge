@@ -75,6 +75,9 @@ static int send_record(int fd, const linsight_can_record_t *r)
     if (r->flags & LINSIGHT_REC_FLAG_RTR) {
         cf.can_id |= CAN_RTR_FLAG;
     }
+    if (r->flags & LINSIGHT_REC_FLAG_ERR) {
+        cf.can_id |= CAN_ERR_FLAG;
+    }
     cf.can_dlc = r->dlc;
     memcpy(cf.data, r->data, r->dlc);
     return write(fd, &cf, sizeof(cf)) == (ssize_t)sizeof(cf) ? 0 : -1;

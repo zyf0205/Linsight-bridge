@@ -25,7 +25,6 @@ target_include_directories(linsight_core PUBLIC
 # Offline file tools used only by linsight-cli.
 add_library(linsight_offline STATIC
     src/compare.c
-    src/dbc.c
     src/replay.c
     src/import.c
     src/report.c)
@@ -57,8 +56,6 @@ add_executable(test_canlog tests/test_canlog.c)
 target_link_libraries(test_canlog PRIVATE linsight_core)
 add_executable(test_compare tests/test_compare.c)
 target_link_libraries(test_compare PRIVATE linsight_offline)
-add_executable(test_dbc tests/test_dbc.c)
-target_link_libraries(test_dbc PRIVATE linsight_offline)
 add_executable(test_session tests/test_session.c)
 target_link_libraries(test_session PRIVATE linsight_core)
 add_executable(test_export tests/test_export.c)
@@ -74,7 +71,6 @@ add_test(NAME fuzz COMMAND test_fuzz)
 add_test(NAME ring COMMAND test_ring)
 add_test(NAME canlog COMMAND test_canlog)
 add_test(NAME compare COMMAND test_compare)
-add_test(NAME dbc COMMAND test_dbc)
 add_test(NAME session COMMAND test_session)
 add_test(NAME export COMMAND test_export)
 add_test(NAME import COMMAND test_import)
