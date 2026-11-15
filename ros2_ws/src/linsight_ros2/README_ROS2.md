@@ -38,14 +38,13 @@ Start `linsightd` as usual and add `--vcan vcan0`:
 
 ```bash
 cd ~/linsight
-sudo ./host/build/linsightd --port 8888 --ctl-port 8889 \
-    --log-dir ~/can-logs --log-max-mb 128 --vcan vcan0
+sudo ./host/build/linsightd --port 8888 --vcan vcan0
 ```
 
-`--vcan` is optional. Without it the daemon behaves exactly as before; with it,
-accepted (already de-duplicated) records are written to `vcan0` nonblocking.
-A full interface queue increments `vcan_dropped` in `linsight-cli stats` instead
-of blocking the device RX path.
+`--vcan` is optional. With it, accepted (already de-duplicated) records are
+paced onto `vcan0` by device timestamps (`--pace 0` restores burst writes).
+A full interface queue increments `vcan_dropped` in the 1 Hz stats line
+instead of blocking the device RX path.
 
 The daemon and the ROS node both open a raw CAN socket, so both need
 `CAP_NET_RAW`. Run the node with `sudo -E` in the same shell, or grant the

@@ -16,6 +16,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import signal
 import socket
 import struct
@@ -23,8 +24,25 @@ import sys
 import time
 
 CAN_FRAME = struct.Struct("=IB3x8s")
-LSC_HEADER = 32
-LSC_REC = struct.Struct("<HIIBB8s")
+
+# Shared .lsc definitions (tools/lscfile.py); inline fallback keeps this file
+# usable when copied around on its own.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from lscfile import LSC_HEADER_SIZE as LSC_HEADER, LSC_REC, read_header
+except ImportError:  # standalone copy without tools/lscfile.py
+    LSC_HEADER = 32
+    LSC_REC = struct.Struct("<HIIBB8s")
+
+    def read_header(f):
+        hdr = f.read(LSC_HEADER)
+        if len(hdr) != LSC_HEADER or hdr[:4] != b"LSC1":
+            raise ValueError("short or invalid .lsc header")
+        if struct.unpack_from("<H", hdr, 4)[0] != 1:
+            raise ValueError("unsupported .lsc version")
+        flags = struct.unpack_from("<I", hdr, 10)[0]
+        if flags & 2 and struct.unpack_from("<I", hdr, 28)[0] > 999:
+            raise ValueError("invalid millisecond anchor")
 PATTERN = b"\x11\x22\x33\x44"
 MAX_CONSEC_ERRORS = 100
 TICK_S = 0.001
@@ -114,14 +132,7 @@ def verify_file(path, can_id, *, ext=False, first=0, expect=None, allow_empty=Fa
     want = first & 0xFFFFFFFF
     expected_flags = 1 if ext else 0
     with open(path, "rb") as f:
-        header = f.read(LSC_HEADER)
-        if len(header) != LSC_HEADER or header[:4] != b"LSC1":
-            raise ValueError("short or invalid .lsc header")
-        if struct.unpack_from("<H", header, 4)[0] != 1:
-            raise ValueError("unsupported .lsc version")
-        flags = struct.unpack_from("<I", header, 10)[0]
-        if flags & 2 and struct.unpack_from("<I", header, 28)[0] > 999:
-            raise ValueError("invalid millisecond anchor")
+        read_header(f)
         while True:
             raw = f.read(LSC_REC.size)
             if not raw:

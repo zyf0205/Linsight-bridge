@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.6.0 — 2026-11-15
+
+- Cut the host down to a pure bridge: `linsightd` is now single-threaded
+  (epoll, no pthread) and does no recording. The `.lsc` writer thread, log
+  rotation/retention, the control socket and the whole `linsight-cli`
+  (12 subcommands) are removed; host/ drops from ~7000 to ~2900 lines.
+- New `tools/lsc.py` (with `tools/lscfile.py`) replaces the CLI for SD
+  black-box files: `export asc|candump|csv`, `verify [--strict]`,
+  `import [--boot-wall]` with byte-identical output to the old C exporter
+  (locked by golden diffs). Recording = device SD card, `--dump`, or
+  tcpdump/SavvyCAN.
+- Paced SocketCAN forwarding: accepted records are forwarded to `--vcan`
+  at their device-timestamped wall times (late backlog compresses instead
+  of stalling), so SavvyCAN/PlotJuggler see real cycle times. `--pace 0`
+  restores burst writes; `--pace-replay` replays historical gaps 1:1;
+  `--dump PATH|-` writes a live candump text stream alongside.
+- Host-side remote control (pause/resume/clear/config/mark) is gone; the
+  CONTROL protocol remains a device capability driven from the device UI.
+- Integration test rewritten around the bridge (passthrough format, time
+  anchoring, PING/PONG, resend and reconnect-backlog dedupe, generation-
+  change flood, clean SIGTERM); ctest drops to 9 entries.
+
 ## v0.5.0 — 2026-11-15
 
 - Slim the host code: remove the in-house `decode` command and the DBC subset

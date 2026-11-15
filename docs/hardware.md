@@ -28,7 +28,7 @@
 | 43 / 44 | UART0 TX / RX | CH340K |
 
 - 除扩展口外没有引出其他 GPIO（GPIO12、22–25 需焊测试点）；所有 IO 为 **3.3V，不耐 5V**。
-- TF 卡：板载 1-bit SDMMC（CLK/CMD/D0 = 47/48/21），无卡检测脚；FAT32、8.3 名 `recNNNNN.lsc`，每 5 s 重试挂载。日志是二进制，挂载时写入的 `README.TXT` 给出上位机 `linsight-cli report` / `export csv` 转换命令。
+- TF 卡：板载 1-bit SDMMC（CLK/CMD/D0 = 47/48/21），无卡检测脚；FAT32、8.3 名 `recNNNNN.lsc`，每 5 s 重试挂载。日志是二进制，挂载时写入的 `README.TXT` 给出 `python3 tools/lsc.py export csv|candump` / `verify` 转换命令。`README.TXT` 只在不存在时写入（O_EXCL）：旧卡上的过期文案需手动删除后重新挂载才会重写。
 
 ## 3. 显示与触摸
 
