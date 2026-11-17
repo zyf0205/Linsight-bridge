@@ -10,6 +10,7 @@
  * black box or tcpdump/SavvyCAN own capture.
  */
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/can.h>
@@ -38,6 +39,10 @@
 #define TAG "linsightd"
 #define LINSIGHT_HOST_VERSION "0.6.0"
 
+#define DISCOVERY_PORT_DEFAULT 8889
+#define DISCOVERY_PROBE "LINSIGHT?1"
+#define DISCOVERY_PROBE_LEN 10u
+
 #define RX_BUF_SIZE 4096
 #define IDLE_TIMEOUT_MS 30000u
 #define DEV_OUT_CAP 4096u
@@ -46,6 +51,8 @@
 #define PACE_PUMP_BUDGET_NS 5000000ull /* ...or 5 ms of pump time, first wins */
 
 static const char *g_port = "8888";
+static int g_discovery_port = DISCOVERY_PORT_DEFAULT;
+static int g_discovery_fd = -1;
 static const char *g_vcan_ifname;
 static int g_vcan_fd = -1;
 static uint64_t g_vcan_written;
@@ -427,7 +434,9 @@ static void device_close(void)
 
 static void device_accept(int listen_fd)
 {
-    int fd = accept(listen_fd, NULL, NULL);
+    struct sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    int fd = accept(listen_fd, (struct sockaddr *)&peer, &peer_len);
     if (fd < 0) {
         return;
     }
@@ -453,7 +462,12 @@ static void device_accept(int listen_fd)
     struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 0}; /* u64 0 = device */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, fd, &ev);
 
-    fprintf(stderr, TAG ": device connected\n");
+    char ip[INET_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip))) {
+        strcpy(ip, "?");
+    }
+    fprintf(stderr, TAG ": device connected from %s:%u\n", ip,
+            (unsigned)ntohs(peer.sin_port));
 }
 
 /* ---------------------------------------------------------- pacing pump */
@@ -506,6 +520,76 @@ static int make_tcp_listener(const char *port)
     return fd;
 }
 
+/* ------------------------------------------------------------- discovery */
+
+/* The device broadcasts DISCOVERY_PROBE from an ephemeral UDP port; the reply
+ * is unicast back to that port and advertises the TCP listener. Discovery is
+ * deliberately separate from the shared v2.1 wire protocol. */
+static int make_discovery_socket(int port)
+{
+    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, TAG ": discovery socket: %s\n", strerror(errno));
+        return -1;
+    }
+    set_nonblock(fd);
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port = htons((uint16_t)port),
+    };
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, TAG ": discovery bind udp :%d: %s\n", port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void discovery_handle(int fd)
+{
+    uint8_t buf[64];
+
+    for (;;) {
+        struct sockaddr_in peer;
+        socklen_t peer_len = sizeof(peer);
+        const ssize_t n =
+            recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&peer, &peer_len);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+            fprintf(stderr, TAG ": discovery recv: %s\n", strerror(errno));
+            return;
+        }
+        if (n != (ssize_t)DISCOVERY_PROBE_LEN ||
+            memcmp(buf, DISCOVERY_PROBE, DISCOVERY_PROBE_LEN) != 0) {
+            continue;
+        }
+
+        char reply[32];
+        const int reply_len = snprintf(reply, sizeof(reply), "LINSIGHT!1 %s\n", g_port);
+        if (reply_len <= 0 || (size_t)reply_len >= sizeof(reply)) {
+            continue;
+        }
+        if (sendto(fd, reply, (size_t)reply_len, 0, (struct sockaddr *)&peer, peer_len) < 0) {
+            fprintf(stderr, TAG ": discovery reply: %s\n", strerror(errno));
+            continue;
+        }
+
+        char ip[INET_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip))) {
+            strcpy(ip, "?");
+        }
+        fprintf(stderr, TAG ": discovery probe from %s:%u -> reply tcp :%s\n", ip,
+                (unsigned)ntohs(peer.sin_port), g_port);
+    }
+}
+
 int main(int argc, char **argv)
 {
     for (int i = 1; i < argc; i++) {
@@ -516,6 +600,14 @@ int main(int argc, char **argv)
                 return 1;
             }
             g_port = argv[i];
+        } else if (strcmp(argv[i], "--discovery-port") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            const long p = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end || p < 0 || p > 65535) {
+                fprintf(stderr, "linsightd: bad discovery port '%s'\n", argv[i]);
+                return 1;
+            }
+            g_discovery_port = (int)p;
         } else if (strcmp(argv[i], "--vcan") == 0 && i + 1 < argc) {
             g_vcan_ifname = argv[++i];
         } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
@@ -534,9 +626,11 @@ int main(int argc, char **argv)
             return 0;
         } else {
             fprintf(stderr,
-                    "usage: linsightd [--port N] [--vcan IFACE] [--dump PATH|-]\n"
-                    "                  [--pace SPEED] [--pace-replay] [--version]\n"
+                    "usage: linsightd [--port N] [--discovery-port N] [--vcan IFACE]\n"
+                    "                  [--dump PATH|-] [--pace SPEED] [--pace-replay]\n"
+                    "                  [--version]\n"
                     "  --dump        candump text, device-timestamped ('-' = stdout)\n"
+                    "  --discovery-port N  UDP host-discovery port (default 8889, 0 disables)\n"
                     "  --pace SPEED  vcan pacing: 0 = burst, >0 wall 1:1 (default 1.0);\n"
                     "                SPEED scales intervals only with --pace-replay\n"
                     "  --pace-replay replay historical gaps 1:1 instead of live wall time\n");
@@ -582,6 +676,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (g_discovery_port != 0) {
+        g_discovery_fd = make_discovery_socket(g_discovery_port);
+    }
+
     g_epoll = epoll_create1(0);
     linsight_parser_init(&g_dev.parser, g_dev.payload, LINSIGHT_MAX_CAN_BATCH);
     if (g_epoll < 0) {
@@ -595,6 +693,10 @@ int main(int argc, char **argv)
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, tcp_fd, &ev);
     ev.data.u64 = 3; /* signalfd */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, sigfd, &ev);
+    if (g_discovery_fd >= 0) {
+        ev.data.u64 = 2; /* UDP discovery */
+        epoll_ctl(g_epoll, EPOLL_CTL_ADD, g_discovery_fd, &ev);
+    }
 
     const int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     if (tfd < 0) {
@@ -610,6 +712,13 @@ int main(int argc, char **argv)
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, tfd, &ev);
 
     fprintf(stderr, TAG ": listening on :%s", g_port);
+    if (g_discovery_fd >= 0) {
+        fprintf(stderr, ", discovery udp :%d", g_discovery_port);
+    } else if (g_discovery_port == 0) {
+        fprintf(stderr, ", discovery disabled");
+    } else {
+        fprintf(stderr, ", discovery unavailable");
+    }
     if (g_vcan_fd >= 0) {
         fprintf(stderr, ", forwarding to SocketCAN %s (%s)", g_vcan_ifname,
                 g_pace_speed > 0.0
@@ -664,6 +773,8 @@ int main(int argc, char **argv)
                         (unsigned long long)g_vcan_dropped,
                         (unsigned)pace_count(&g_pace));
                 last_recs = g_dev.recs;
+            } else if (tag == 2) { /* UDP discovery */
+                discovery_handle(g_discovery_fd);
             } else if (tag == 1) {
                 device_accept(tcp_fd);
             } else if (tag == 0) { /* device socket */
@@ -716,6 +827,10 @@ int main(int argc, char **argv)
     if (g_vcan_fd >= 0) {
         close(g_vcan_fd);
         g_vcan_fd = -1;
+    }
+    if (g_discovery_fd >= 0) {
+        close(g_discovery_fd);
+        g_discovery_fd = -1;
     }
     close(tcp_fd);
     fprintf(stderr, TAG ": exited cleanly\n");

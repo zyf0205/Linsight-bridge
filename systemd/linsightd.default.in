@@ -3,4 +3,5 @@
 # vcan0 is created at boot by vcan0.service.
 # Add --dump /path/to/cap.log (or --dump -) for a candump text stream.
 # --pace SPEED / --pace-replay control vcan pacing (see linsightd --help).
+# Discovery listens on UDP 8889 by default; add --discovery-port 0 to disable.
 LINSIGHTD_ARGS=--port 8888 --vcan vcan0

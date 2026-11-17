@@ -30,6 +30,7 @@ sudo ./build/linsightd --port 8888 --vcan vcan0
 | 参数 | 说明 |
 |---|---|
 | `--port N` | 设备 TCP 端口（默认 `8888`） |
+| `--discovery-port N` | 设备自动发现的 UDP 端口（默认 `8889`，`0` 关闭） |
 | `--vcan IFACE` | 把有效记录转发到 SocketCAN |
 | `--pace SPEED` | 节流倍速，`0` = 不节流（默认 `1.0`） |
 | `--pace-replay` | 按历史间隔 1:1 回放，而不是压缩到实时 |
@@ -42,6 +43,16 @@ EXT/RTR/ERR 记录分别映射到
 
 设备每 5 s 发一次 PING，静默 30 s 后断开。1 Hz 统计行输出
 `recs/dump/vcan/vcan_dropped/paceq`。
+
+## 设备发现
+
+设备上电或重连后向 UDP 8889 广播 `LINSIGHT?1`，`linsightd` 用来源 IP 单播回复
+`LINSIGHT!1 <tcp_port>\n`。设备使用回复中的 TCP 端口连接，所以主机 IP 或端口
+变化不需要重烧固件。`--discovery-port 0` 关闭发现，设备回退到固件里的静态
+`CONFIG_LINSIGHT_HOST_IP/PORT`。
+
+发现依赖 WSL 的 mirrored 网络；NAT 模式收不到局域网广播。若重新启用防火墙，
+放行 TCP 8888 和 UDP 8889（Windows 防火墙与 Hyper-V 防火墙）。
 
 ## 服务（开机自启）
 

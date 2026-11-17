@@ -40,9 +40,10 @@ Analysis belongs to ecosystem tools (SavvyCAN, Wireshark, PlotJuggler) fed via
 ## Architecture
 
 - `linsightd` (single-threaded epoll): TCP listener for the device
-  (`INADDR_ANY`), signalfd, 1 Hz timerfd (idle watchdog + stats line +
-  `--dump` flush). One device session at a time; no writer thread, no
-  recording — the SD black box or tcpdump/SavvyCAN own capture.
+  (`INADDR_ANY`), UDP discovery responder (default `8889`, tag 2; replies to
+  `LINSIGHT?1` with the TCP port), signalfd, 1 Hz timerfd (idle watchdog +
+  stats line + `--dump` flush). One device session at a time; no writer
+  thread, no recording — the SD black box or tcpdump/SavvyCAN own capture.
 - Dedupe: `session_record_new` skips a reconnect backlog by `ts_ms`/`seq`
   marks; marks survive a reconnect with the same boot count and clear on a
   boot change. HELLO `uptime_ms` anchors device time once per boot; old
