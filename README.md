@@ -1,10 +1,9 @@
 # LinSight 桥接服务
 
-LinSight 无线 CAN 分析仪的 Linux 上位机。`linsightd` 接收设备 TCP 会话，跳过重连积压，按设备时间戳把记录转发到 SocketCAN，或输出 candump 文本。服务不做采集落盘：要文本用 `--dump`，完整抓包由设备 SD 卡或 tcpdump/SavvyCAN 负责。
+LinSight 无线 CAN 分析仪的 Linux 上位机。`linsightd` 是基于单线程 `epoll` 的轻量守护进程，接收设备 TCP 会话，跳过重连积压，并按设备时间戳把记录 1:1 转发到内核 SocketCAN。抓包、文本流与波形分析直接交由 Linux 生态工具（`candump`、SavvyCAN、PlotJuggler、`tcpdump`）处理。
 
 ```text
-设备 ──Wi-Fi/TCP──> linsightd ──> --vcan IFACE  → SavvyCAN / PlotJuggler / candump
-                         └──────> --dump PATH|-  → candump 文本
+设备 ──Wi-Fi/TCP──> linsightd ──> --vcan IFACE  → SavvyCAN / PlotJuggler / candump / tcpdump
 ```
 
 设备使用 v2.1 协议，解析器在 `protocol/`。
@@ -19,26 +18,23 @@ sudo ip link set vcan0 up
 sudo ./build/linsightd --port 8888 --vcan vcan0
 ```
 
-`--vcan` 需要 `CAP_NET_RAW`；只用 `--dump` 时不需要 root。
+`--vcan` 需要 `CAP_NET_RAW`。
 
 ## 参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--port N` | `8888` | 设备 TCP 端口 |
+| `--port N` | `8888` | 设备 TCP 监听端口 |
 | `--discovery-port N` | `8889` | UDP 设备发现端口，`0` 关闭 |
 | `--vcan IFACE` | 无 | 把记录转发到 SocketCAN 接口 |
-| `--dump PATH\|-` | 无 | 输出 candump 文本到文件或 stdout |
-| `--pace SPEED` | `1.0` | `0` = 不节流；倍速只对 `--pace-replay` 生效 |
-| `--pace-replay` | 关 | 按历史间隔 1:1 回放，而不是压缩到实时 |
+| `--no-pace` / `--pace 0` | 关（默认 `1` 节流） | 关闭节流，收到即突发转发到 SocketCAN |
 | `--version` | | 打印版本号 |
 
 ## 转发与节流
 
-- 设备时间通过 HELLO 的 `uptime_ms` 对齐本机时钟；旧固件没有该字段时，用首条记录的时间对齐。
-- 默认按设备时间戳到点转发，SavvyCAN 里看到的周期就是真实周期。重连积压的目标时间已过，立即发出，不做追赶式休眠。
-- `--pace 0` 收到即发。
-- `--pace-replay` 从会话起点按历史间隔回放；`--pace 2.0` 为两倍速。
+- 设备时间通过 HELLO 的 `uptime_ms` 对齐本机 `CLOCK_MONOTONIC` 单调时钟；旧固件没有该字段时，用首条记录的时间对齐。
+- 默认按设备时间戳 1:1 到点转发，SavvyCAN / PlotJuggler 里看到的周期就是真实周期。重连积压的目标时间已过，立即发出，不做追赶式休眠。
+- `--no-pace`（或 `--pace 0`）收到即发。
 - 队列 262144 条，满了丢最旧。每轮主循环最多转发 4096 条或耗时 5 ms，积压不会拖住 PING/PONG。
 - EXT/RTR/ERR 记录分别映射到 `CAN_EFF_FLAG`/`CAN_RTR_FLAG`/`CAN_ERR_FLAG`；接口队列满时写失败计入 `vcan_dropped`。
 
@@ -48,21 +44,15 @@ sudo ./build/linsightd --port 8888 --vcan vcan0
 - 按 `ts_ms`/`seq` 记标记，设备重连后重发的积压被跳过；`boot` 计数变化（设备重启）时清空标记。
 - 设备每 5 s 发 PING，30 s 无数据则断开。
 
-## 输出
-
-`--dump` 每批写入后立即 flush，格式与 can-utils 一致：
-
-```text
-(1731923456.123000) can0 123#11223344
-```
+## 监控与统计
 
 stderr 每秒打印一行统计：
 
 ```text
-linsightd: recs=37366 (+120) dump=37366 vcan=37366 vcan_dropped=0 paceq=0
+linsightd: recs=37366 (+120) vcan=37366 vcan_dropped=0 paceq=0
 ```
 
-`recs` 为收到的原始记录，其余为写入行数、转发帧数、写失败数和队列长度。
+`recs` 为收到的有效记录，其余为 SocketCAN 转发帧数、写失败数和节流队列长度。
 
 ## 设备发现
 
@@ -103,7 +93,7 @@ sudo systemctl restart linsightd
 ## 仓库结构
 
 ```text
-src/        linsightd（main.c）、会话去重（session.c）、节流队列（pace.c）
+src/main.c  单文件 epoll 守护进程（TCP/UDP/signalfd/timerfd/SocketCAN、会话去重、单调时钟节流）
 protocol/   共享 v2.1 解析器（与固件仓库同步）
 systemd/    linsightd.service、vcan0.service、参数模板
 ```

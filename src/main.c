@@ -1,16 +1,18 @@
 /*
- * linsightd — LinSight CAN bridge daemon (M3).
+ * linsightd — LinSight CAN to SocketCAN bridge daemon.
  *
- * Single-threaded epoll loop: TCP listener for the device, signalfd
- * (SIGTERM/SIGINT graceful exit) and a 1 Hz timerfd (idle watchdog + stats).
- * One device session at a time; CAN_BATCH records are de-duplicated against
- * reconnect backlogs, written as candump text (--dump) and paced onto a
- * SocketCAN interface (--vcan) by their device timestamps, so cycle times in
- * SavvyCAN/PlotJuggler are real. The bridge does not record: the device SD
- * black box or tcpdump/SavvyCAN own capture.
+ * Single-threaded Linux epoll loop:
+ *   - TCP listener (:8888) + single active nonblocking device session
+ *   - UDP discovery responder (:8889, "LINSIGHT?1" -> "LINSIGHT!1 <port>\n")
+ *   - signalfd (SIGINT/SIGTERM graceful exit, SIGPIPE blocked)
+ *   - 1 Hz timerfd (30 s idle watchdog + stderr stats)
+ *   - PF_CAN (SOCK_RAW) SocketCAN forwarding with CLOCK_MONOTONIC 1:1 pacing
  */
 
+#define _DEFAULT_SOURCE
+
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/can.h>
@@ -33,22 +35,197 @@
 #include <unistd.h>
 
 #include "frame.h"
-#include "pace.h"
-#include "session.h"
 
 #define TAG "linsightd"
-#define LINSIGHT_HOST_VERSION "0.6.0"
+#define LINSIGHT_HOST_VERSION "0.7.0"
 
 #define DISCOVERY_PORT_DEFAULT 8889
 #define DISCOVERY_PROBE "LINSIGHT?1"
 #define DISCOVERY_PROBE_LEN 10u
 
 #define RX_BUF_SIZE 4096
-#define IDLE_TIMEOUT_MS 30000u
-#define DEV_OUT_CAP 4096u
-#define MAX_EVENTS 64
-#define PACE_PUMP_MAX 4096u           /* records forwarded per main-loop pump */
-#define PACE_PUMP_BUDGET_NS 5000000ull /* ...or 5 ms of pump time, first wins */
+#define IDLE_TIMEOUT_SEC 30
+#define DEV_OUT_CAP 64u
+#define MAX_EVENTS 16
+
+#define PACEQ_CAP 262144u              /* 262k-entry drop-oldest ring (~8 MiB) */
+#define PACE_NS_PER_MS 1000000ULL      /* 1 ms in nanoseconds */
+#define PACE_PUMP_MAX 4096u            /* max frames per epoll iteration */
+#define PACE_PUMP_BUDGET_NS 5000000ULL /* max 5 ms pump time per iteration */
+
+enum {
+    EPOLL_TAG_DEVICE = 0,
+    EPOLL_TAG_TCP_LISTEN = 1,
+    EPOLL_TAG_DISCOVERY = 2,
+    EPOLL_TAG_SIGNAL = 3,
+    EPOLL_TAG_TIMER = 4,
+};
+
+/* ------------------------------------------------ session & deduplication */
+
+typedef struct {
+    uint32_t boot_count;
+    bool have_boot;
+    bool have_mark;
+    uint32_t last_ts_ms;
+    uint16_t last_seq;
+} session_state_t;
+
+static bool json_u32(const char *json, const char *key, uint32_t *out)
+{
+    char pattern[32];
+    const int n = snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    if (n <= 0 || n >= (int)sizeof(pattern)) {
+        return false;
+    }
+    const char *p = strstr(json, pattern);
+    if (!p) {
+        return false;
+    }
+    p += n;
+    while (*p == ' ') {
+        p++;
+    }
+    if (!isdigit((unsigned char)*p)) {
+        return false;
+    }
+    char *end = NULL;
+    const unsigned long v = strtoul(p, &end, 10);
+    if (end == p) {
+        return false;
+    }
+    *out = (uint32_t)v;
+    return true;
+}
+
+static void session_reset(session_state_t *s, uint32_t boot_count, bool have_boot)
+{
+    if (!have_boot || (s->have_boot && boot_count != s->boot_count)) {
+        s->have_mark = false;
+    }
+    s->boot_count = boot_count;
+    s->have_boot = have_boot;
+}
+
+/* Filter out reconnect backlog records already seen in the same boot session. */
+static bool session_record_new(session_state_t *s, const linsight_can_record_t *rec)
+{
+    if (!s->have_mark) {
+        s->have_mark = true;
+        s->last_ts_ms = rec->ts_ms;
+        s->last_seq = rec->seq;
+        return true;
+    }
+    if (rec->ts_ms < s->last_ts_ms) {
+        return false;
+    }
+    if (rec->ts_ms == s->last_ts_ms) {
+        const int16_t diff = (int16_t)(rec->seq - s->last_seq);
+        if (diff <= 0 && diff > -1024) {
+            return false;
+        }
+    }
+    s->last_ts_ms = rec->ts_ms;
+    s->last_seq = rec->seq;
+    return true;
+}
+
+/* --------------------------------------------- monotonic wall-clock pacer */
+
+typedef struct {
+    linsight_can_record_t rec;
+    uint64_t target_ns;
+} pace_entry_t;
+
+typedef struct {
+    pace_entry_t q[PACEQ_CAP];
+    uint32_t head;
+    uint32_t count;
+    bool anchored;
+    uint64_t anchor_mono_ns;
+    uint32_t anchor_dev_ms;
+    bool have_last;
+    uint32_t last_dev_ms;
+    uint64_t last_target_ns;
+} pace_t;
+
+static void pace_anchor(pace_t *p, uint64_t now_ns, uint32_t dev_ms)
+{
+    p->anchor_mono_ns = now_ns;
+    p->anchor_dev_ms = dev_ms;
+    p->anchored = true;
+    p->last_dev_ms = 0;
+}
+
+static void pace_push(pace_t *p, const linsight_can_record_t *r, uint64_t now_ns)
+{
+    uint64_t target = now_ns;
+    if (p->have_last && r->ts_ms < p->last_dev_ms) {
+        target = p->last_target_ns;
+    } else if (p->anchored && r->ts_ms > p->anchor_dev_ms) {
+        target = p->anchor_mono_ns +
+                 (uint64_t)(r->ts_ms - p->anchor_dev_ms) * PACE_NS_PER_MS;
+    } else if (p->anchored) {
+        target = p->anchor_mono_ns;
+    }
+
+    if (p->have_last &&
+        (target < p->last_target_ns || target - p->last_target_ns < PACE_NS_PER_MS)) {
+        target = p->last_target_ns;
+    }
+
+    if (p->count == PACEQ_CAP) {
+        p->head = (p->head + 1u) % PACEQ_CAP;
+        p->count--;
+    }
+    p->q[(p->head + p->count) % PACEQ_CAP] =
+        (pace_entry_t){.rec = *r, .target_ns = target};
+    p->count++;
+    p->have_last = true;
+    p->last_dev_ms = r->ts_ms;
+    p->last_target_ns = target;
+}
+
+static uint32_t pace_pop_due(pace_t *p, uint64_t now_ns, linsight_can_record_t *out,
+                             uint32_t cap)
+{
+    uint32_t n = 0;
+    while (n < cap && p->count > 0 && p->q[p->head].target_ns <= now_ns) {
+        out[n++] = p->q[p->head].rec;
+        p->head = (p->head + 1u) % PACEQ_CAP;
+        p->count--;
+    }
+    return n;
+}
+
+static int pace_epoll_timeout_ms(const pace_t *p, uint64_t now_ns)
+{
+    if (p->count == 0) {
+        return -1;
+    }
+    const uint64_t target = p->q[p->head].target_ns;
+    if (target <= now_ns) {
+        return 0;
+    }
+    const uint64_t diff = target - now_ns;
+    const uint64_t ms = diff / PACE_NS_PER_MS + (diff % PACE_NS_PER_MS != 0 ? 1u : 0u);
+    return ms > 0x7FFFFFFFull ? 0x7FFFFFFF : (int)ms;
+}
+
+/* ------------------------------------------------------------ daemon state */
+
+typedef struct {
+    int fd;
+    linsight_parser_t parser;
+    uint8_t payload[LINSIGHT_MAX_CAN_BATCH];
+    uint64_t recs;
+    time_t last_rx;
+    bool anchor_valid;
+    session_state_t sess;
+    uint8_t out[DEV_OUT_CAP];
+    size_t out_off;
+    size_t out_len;
+} device_t;
 
 static const char *g_port = "8888";
 static int g_discovery_port = DISCOVERY_PORT_DEFAULT;
@@ -57,33 +234,8 @@ static const char *g_vcan_ifname;
 static int g_vcan_fd = -1;
 static uint64_t g_vcan_written;
 static uint64_t g_vcan_dropped;
-static const char *g_dump_path; /* "-" = stdout */
-static FILE *g_dump;
-static uint64_t g_dump_lines;
-static double g_pace_speed = 1.0; /* 0 = burst (old unpaced behaviour) */
-static bool g_pace_replay;        /* --pace-replay: 1:1 historical pacing */
+static bool g_paced = true;
 static pace_t g_pace;
-
-/* ------------------------------------------------------------- session */
-
-typedef struct {
-    int fd;
-    linsight_parser_t parser;
-    uint8_t payload[LINSIGHT_MAX_CAN_BATCH];
-    uint64_t recs; /* raw records received this session */
-    time_t last_rx;
-    bool anchor_valid;
-    uint64_t anchor_wall_ms;
-    char device_id[16];
-    uint32_t boot_count;
-    session_state_t sess;
-
-    /* Epoll-owned output queue: callbacks only append; EPOLLOUT drains it. */
-    uint8_t out[DEV_OUT_CAP];
-    size_t out_off;
-    size_t out_len;
-} device_t;
-
 static device_t g_dev = {.fd = -1};
 static int g_epoll = -1;
 static volatile sig_atomic_t g_stop;
@@ -93,21 +245,16 @@ static void device_close(void);
 static void set_nonblock(int fd)
 {
     const int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags >= 0) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
 }
 
 static uint64_t mono_ns(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
-static uint64_t wall_ms_now(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
 /* ------------------------------------------------------- SocketCAN forward */
@@ -128,9 +275,10 @@ static int vcan_open(const char *ifname)
         return -1;
     }
 
-    struct sockaddr_can addr = {0};
-    addr.can_family = AF_CAN;
-    addr.can_ifindex = ifr.ifr_ifindex;
+    struct sockaddr_can addr = {
+        .can_family = AF_CAN,
+        .can_ifindex = ifr.ifr_ifindex,
+    };
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, TAG ": vcan bind %s: %s\n", ifname, strerror(errno));
         close(fd);
@@ -141,8 +289,6 @@ static int vcan_open(const char *ifname)
     return fd;
 }
 
-/* Best-effort, nonblocking: a full interface queue drops this frame and never
- * stalls the device RX path. */
 static void vcan_forward(const linsight_can_record_t *recs, uint32_t n)
 {
     if (g_vcan_fd < 0) {
@@ -164,83 +310,15 @@ static void vcan_forward(const linsight_can_record_t *recs, uint32_t n)
         cf.can_dlc = recs[i].dlc > 8 ? 8 : recs[i].dlc;
         memcpy(cf.data, recs[i].data, cf.can_dlc);
 
-        if (write(g_vcan_fd, &cf, sizeof(cf)) != (ssize_t)sizeof(cf)) {
-            g_vcan_dropped++;
-        } else {
+        if (write(g_vcan_fd, &cf, sizeof(cf)) == (ssize_t)sizeof(cf)) {
             g_vcan_written++;
+        } else {
+            g_vcan_dropped++;
         }
     }
 }
 
-/* ------------------------------------------------------------ dump output */
-
-/* Byte-compatible with the former canlog_format_candump_ms() so `--dump`
- * lines match can-utils candump exactly. */
-static int dump_format_line(const linsight_can_record_t *r, uint64_t start_wall_ms,
-                            char *buf, size_t cap)
-{
-    const uint64_t wall_ms = start_wall_ms + (uint64_t)r->ts_ms;
-    const uint64_t sec = wall_ms / 1000u;
-    const uint64_t usec = (wall_ms % 1000u) * 1000u;
-    const unsigned id = (unsigned)(r->id & 0x1FFFFFFFu);
-    const bool ext = (r->flags & LINSIGHT_REC_FLAG_EXT) != 0;
-    int used;
-    if (ext) {
-        used = snprintf(buf, cap, "(%llu.%06llu) can0 %08X#", (unsigned long long)sec,
-                        (unsigned long long)usec, id);
-    } else {
-        used = snprintf(buf, cap, "(%llu.%06llu) can0 %03X#", (unsigned long long)sec,
-                        (unsigned long long)usec, id);
-    }
-    if (used < 0 || (size_t)used >= cap) {
-        return -1;
-    }
-    if (r->flags & LINSIGHT_REC_FLAG_RTR) {
-        if ((size_t)used + 2 > cap) {
-            return -1;
-        }
-        buf[used++] = 'R';
-        buf[used] = '\0';
-        return used;
-    }
-    for (uint32_t i = 0; i < r->dlc && i < LINSIGHT_DLC_MAX; i++) {
-        if ((size_t)used + 3 > cap) {
-            return -1;
-        }
-        const int n = snprintf(buf + used, cap - (size_t)used, "%02X", r->data[i]);
-        if (n != 2) {
-            return -1;
-        }
-        used += n;
-    }
-    return used;
-}
-
-static void dump_write_records(const linsight_can_record_t *recs, uint32_t n)
-{
-    if (!g_dump) {
-        return;
-    }
-    char line[128];
-    for (uint32_t i = 0; i < n; i++) {
-        const int len = dump_format_line(&recs[i], g_dev.anchor_wall_ms, line,
-                                         sizeof(line) - 1);
-        if (len <= 0) {
-            continue;
-        }
-        line[len] = '\n';
-        if (fwrite(line, 1, (size_t)len + 1, g_dump) == (size_t)len + 1) {
-            g_dump_lines++;
-        }
-    }
-    if (n) {
-        /* Per-batch flush: --dump behaves like a live stream (candump-like),
-         * so readers see lines without waiting for the 1 Hz tick. */
-        fflush(g_dump);
-    }
-}
-
-/* ------------------------------------------------------- output queues */
+/* ----------------------------------------------------- device TX & framing */
 
 static void device_update_epoll(void)
 {
@@ -249,17 +327,15 @@ static void device_update_epoll(void)
     }
     struct epoll_event ev = {
         .events = EPOLLIN | (g_dev.out_len > g_dev.out_off ? EPOLLOUT : 0),
-        .data.u64 = 0,
+        .data.u64 = EPOLL_TAG_DEVICE,
     };
     epoll_ctl(g_epoll, EPOLL_CTL_MOD, g_dev.fd, &ev);
 }
 
-/* Append one complete device frame. PONG is tiny; if the queue is full the
- * frame is dropped rather than blocking the epoll loop. */
-static bool device_queue_frame(uint8_t type, const void *payload, uint16_t len)
+static void device_queue_pong(const void *payload, uint16_t len)
 {
-    if (g_dev.fd < 0 || len > LINSIGHT_MAX_CONTROL) {
-        return false;
+    if (g_dev.fd < 0 || len > LINSIGHT_MAX_PONG) {
+        return;
     }
     if (g_dev.out_off > 0) {
         memmove(g_dev.out, g_dev.out + g_dev.out_off, g_dev.out_len - g_dev.out_off);
@@ -268,23 +344,19 @@ static bool device_queue_frame(uint8_t type, const void *payload, uint16_t len)
     }
     const size_t total = LINSIGHT_FRAME_HEADER_SIZE + len;
     if (total > sizeof(g_dev.out) - g_dev.out_len) {
-        return false;
+        return;
     }
-    linsight_frame_write_header(g_dev.out + g_dev.out_len, type, len);
+    linsight_frame_write_header(g_dev.out + g_dev.out_len, LINSIGHT_FRAME_PONG, len);
     if (len) {
         memcpy(g_dev.out + g_dev.out_len + LINSIGHT_FRAME_HEADER_SIZE, payload, len);
     }
     g_dev.out_len += total;
     device_update_epoll();
-    return true;
 }
 
 static void device_flush(void)
 {
-    if (g_dev.fd < 0) {
-        return;
-    }
-    while (g_dev.out_off < g_dev.out_len) {
+    while (g_dev.fd >= 0 && g_dev.out_off < g_dev.out_len) {
         const ssize_t n = send(g_dev.fd, g_dev.out + g_dev.out_off,
                                g_dev.out_len - g_dev.out_off, MSG_NOSIGNAL);
         if (n > 0) {
@@ -307,23 +379,12 @@ static void device_flush(void)
     device_update_epoll();
 }
 
-/* ------------------------------------------------------------- frames */
-
-static void pace_bind_if_wall(void)
-{
-    if (g_vcan_fd >= 0 && g_pace_speed > 0.0 && !g_pace_replay) {
-        pace_bind_wall(&g_pace, g_dev.anchor_wall_ms, mono_ns(), wall_ms_now());
-    }
-}
-
 static void handle_batch(const uint8_t *payload, uint16_t len)
 {
     if (g_dev.fd < 0 || len < 2) {
         return;
     }
     const uint16_t count = linsight_get_u16(payload);
-    /* 32-bit length math: a u16 cast here would wrap for count > 3276 and
-     * let a malformed frame read/write far past the buffers. */
     const uint32_t need = 2u + (uint32_t)count * LINSIGHT_REC_SIZE;
     if (count == 0 || count > LINSIGHT_BATCH_MAX_RECORDS || (uint32_t)len < need) {
         fprintf(stderr, TAG ": bad batch len %u count %u\n", (unsigned)len,
@@ -333,45 +394,30 @@ static void handle_batch(const uint8_t *payload, uint16_t len)
 
     static linsight_can_record_t recs[LINSIGHT_BATCH_MAX_RECORDS];
     uint32_t valid = 0;
-    for (uint16_t i = 0; i < count; i++) {
-        const uint8_t *p = payload + 2 + (size_t)i * LINSIGHT_REC_SIZE;
-        linsight_can_record_t r;
-        if (linsight_record_unpack(p, &r)) {
-            recs[valid++] = r;
-        }
-    }
-    if (valid < count) {
-        fprintf(stderr, TAG ": batch had %u invalid records\n",
-                (unsigned)(count - valid));
-    }
-
-    /* Dedupe against a reconnect backlog and count gaps; only accepted
-     * records reach the dump and the vcan forwarder. */
     uint32_t accepted = 0;
-    for (uint32_t i = 0; i < valid; i++) {
-        if (session_record_new(&g_dev.sess, &recs[i])) {
-            recs[accepted++] = recs[i];
+    for (uint16_t i = 0; i < count; i++) {
+        linsight_can_record_t r;
+        if (linsight_record_unpack(payload + 2 + (size_t)i * LINSIGHT_REC_SIZE, &r)) {
+            valid++;
+            if (session_record_new(&g_dev.sess, &r)) {
+                recs[accepted++] = r;
+            }
         }
     }
     g_dev.recs += valid;
-    if (!accepted) {
+    if (!accepted || g_vcan_fd < 0) {
         return;
     }
 
+    const uint64_t now = mono_ns();
     if (!g_dev.anchor_valid) {
-        /* Old firmware without HELLO uptime: map the first record's
-         * uptime onto the current wall clock. */
-        g_dev.anchor_wall_ms =
-            session_anchor_start_wall_ms(wall_ms_now(), recs[0].ts_ms);
+        pace_anchor(&g_pace, now, recs[0].ts_ms);
         g_dev.anchor_valid = true;
-        pace_bind_if_wall();
     }
-    dump_write_records(recs, accepted);
-    if (g_vcan_fd < 0 || g_pace_speed <= 0.0) {
+    if (!g_paced) {
         vcan_forward(recs, accepted);
         return;
     }
-    const uint64_t now = mono_ns();
     for (uint32_t i = 0; i < accepted; i++) {
         pace_push(&g_pace, &recs[i], now);
     }
@@ -383,20 +429,21 @@ static void handle_frame(void *ctx, uint8_t type, const uint8_t *payload, uint16
     switch (type) {
     case LINSIGHT_FRAME_HELLO: {
         fprintf(stderr, TAG ": device hello: %.*s\n", (int)len, (const char *)payload);
-        session_hello_t h;
-        if (!session_parse_hello(payload, len, &h)) {
+        if (!payload || len == 0 || len > LINSIGHT_MAX_HELLO) {
             break;
         }
-        if (h.has_device_id) {
-            snprintf(g_dev.device_id, sizeof(g_dev.device_id), "%s", h.device_id);
-        }
-        g_dev.boot_count = h.boot_count;
-        session_reset(&g_dev.sess, h.boot_count, h.has_boot);
-        if (h.has_uptime) {
-            g_dev.anchor_wall_ms =
-                session_anchor_start_wall_ms(wall_ms_now(), h.uptime_ms);
+        char json[LINSIGHT_MAX_HELLO + 1];
+        memcpy(json, payload, len);
+        json[len] = '\0';
+
+        uint32_t boot = 0;
+        const bool has_boot = json_u32(json, "boot", &boot);
+        session_reset(&g_dev.sess, boot, has_boot);
+
+        uint32_t uptime_ms = 0;
+        if (json_u32(json, "uptime_ms", &uptime_ms)) {
+            pace_anchor(&g_pace, mono_ns(), uptime_ms);
             g_dev.anchor_valid = true;
-            pace_bind_if_wall();
         }
         break;
     }
@@ -407,15 +454,14 @@ static void handle_frame(void *ctx, uint8_t type, const uint8_t *payload, uint16
         fprintf(stderr, TAG ": device event: %.*s\n", (int)len, (const char *)payload);
         break;
     case LINSIGHT_FRAME_PING:
-        (void)device_queue_frame(LINSIGHT_FRAME_PONG, payload, len);
+        device_queue_pong(payload, len);
         break;
     default:
-        /* STATS/DEVICE_INFO/PONG/ACK are ignored: the bridge has no CLI. */
         break;
     }
 }
 
-/* ------------------------------------------------------------- sessions */
+/* ----------------------------------------------------- connection & pump */
 
 static void device_close(void)
 {
@@ -436,7 +482,7 @@ static void device_accept(int listen_fd)
 {
     struct sockaddr_in peer;
     socklen_t peer_len = sizeof(peer);
-    int fd = accept(listen_fd, (struct sockaddr *)&peer, &peer_len);
+    const int fd = accept(listen_fd, (struct sockaddr *)&peer, &peer_len);
     if (fd < 0) {
         return;
     }
@@ -446,20 +492,16 @@ static void device_accept(int listen_fd)
     }
 
     set_nonblock(fd);
-    static int one = 1;
+    static const int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     g_dev.fd = fd;
     g_dev.recs = 0;
     g_dev.last_rx = time(NULL);
     g_dev.anchor_valid = false;
-    session_clear_counters(&g_dev.sess);
     linsight_parser_reset(&g_dev.parser);
-    /* The pace queue survives the reconnect: backlog records already queued
-     * keep their targets; --pace-replay re-bases onto "now". */
-    pace_new_session(&g_pace, mono_ns());
 
-    struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 0}; /* u64 0 = device */
+    struct epoll_event ev = {.events = EPOLLIN, .data.u64 = EPOLL_TAG_DEVICE};
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, fd, &ev);
 
     char ip[INET_ADDRSTRLEN];
@@ -470,24 +512,16 @@ static void device_accept(int listen_fd)
             (unsigned)ntohs(peer.sin_port));
 }
 
-/* ---------------------------------------------------------- pacing pump */
-
-/* Forward due records within a per-iteration budget (records / time, first
- * wins). Leftovers stay queued; pace_epoll_timeout_ms() then returns 0 and
- * the next epoll iteration continues immediately, so a burst never delays
- * PONG/event handling by more than one budget window. */
 static void pace_pump(void)
 {
-    if (g_vcan_fd < 0 || g_pace_speed <= 0.0) {
+    if (g_vcan_fd < 0 || !g_paced) {
         return;
     }
     static linsight_can_record_t out[256];
     const uint64_t t0 = mono_ns();
     uint32_t budget = PACE_PUMP_MAX;
     while (budget) {
-        const uint32_t want = budget < (uint32_t)(sizeof(out) / sizeof(out[0]))
-                                  ? budget
-                                  : (uint32_t)(sizeof(out) / sizeof(out[0]));
+        const uint32_t want = budget < 256u ? budget : 256u;
         const uint32_t got = pace_pop_due(&g_pace, mono_ns(), out, want);
         if (!got) {
             break;
@@ -500,7 +534,7 @@ static void pace_pump(void)
     }
 }
 
-/* ------------------------------------------------------------- listener */
+/* ------------------------------------------------ TCP listener & discovery */
 
 static int make_tcp_listener(const char *port)
 {
@@ -510,8 +544,11 @@ static int make_tcp_listener(const char *port)
     }
     static const int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_ANY)};
-    addr.sin_port = htons((uint16_t)atoi(port));
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port = htons((uint16_t)atoi(port)),
+    };
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 4) < 0) {
         close(fd);
         return -1;
@@ -520,11 +557,6 @@ static int make_tcp_listener(const char *port)
     return fd;
 }
 
-/* ------------------------------------------------------------- discovery */
-
-/* The device broadcasts DISCOVERY_PROBE from an ephemeral UDP port; the reply
- * is unicast back to that port and advertises the TCP listener. Discovery is
- * deliberately separate from the shared v2.1 wire protocol. */
 static int make_discovery_socket(int port)
 {
     const int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -533,7 +565,6 @@ static int make_discovery_socket(int port)
         return -1;
     }
     set_nonblock(fd);
-
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = htonl(INADDR_ANY),
@@ -550,7 +581,6 @@ static int make_discovery_socket(int port)
 static void discovery_handle(int fd)
 {
     uint8_t buf[64];
-
     for (;;) {
         struct sockaddr_in peer;
         socklen_t peer_len = sizeof(peer);
@@ -560,10 +590,9 @@ static void discovery_handle(int fd)
             if (errno == EINTR) {
                 continue;
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                fprintf(stderr, TAG ": discovery recv: %s\n", strerror(errno));
             }
-            fprintf(stderr, TAG ": discovery recv: %s\n", strerror(errno));
             return;
         }
         if (n != (ssize_t)DISCOVERY_PROBE_LEN ||
@@ -573,22 +602,13 @@ static void discovery_handle(int fd)
 
         char reply[32];
         const int reply_len = snprintf(reply, sizeof(reply), "LINSIGHT!1 %s\n", g_port);
-        if (reply_len <= 0 || (size_t)reply_len >= sizeof(reply)) {
-            continue;
+        if (reply_len > 0 && (size_t)reply_len < sizeof(reply)) {
+            sendto(fd, reply, (size_t)reply_len, 0, (struct sockaddr *)&peer, peer_len);
         }
-        if (sendto(fd, reply, (size_t)reply_len, 0, (struct sockaddr *)&peer, peer_len) < 0) {
-            fprintf(stderr, TAG ": discovery reply: %s\n", strerror(errno));
-            continue;
-        }
-
-        char ip[INET_ADDRSTRLEN];
-        if (!inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip))) {
-            strcpy(ip, "?");
-        }
-        fprintf(stderr, TAG ": discovery probe from %s:%u -> reply tcp :%s\n", ip,
-                (unsigned)ntohs(peer.sin_port), g_port);
     }
 }
+
+/* -------------------------------------------------------------------- main */
 
 int main(int argc, char **argv)
 {
@@ -596,7 +616,7 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             const int p = atoi(argv[++i]);
             if (p <= 0 || p > 65535) {
-                fprintf(stderr, "linsightd: bad port '%s'\n", argv[i]);
+                fprintf(stderr, TAG ": bad port '%s'\n", argv[i]);
                 return 1;
             }
             g_port = argv[i];
@@ -604,49 +624,30 @@ int main(int argc, char **argv)
             char *end = NULL;
             const long p = strtol(argv[++i], &end, 10);
             if (end == argv[i] || *end || p < 0 || p > 65535) {
-                fprintf(stderr, "linsightd: bad discovery port '%s'\n", argv[i]);
+                fprintf(stderr, TAG ": bad discovery port '%s'\n", argv[i]);
                 return 1;
             }
             g_discovery_port = (int)p;
         } else if (strcmp(argv[i], "--vcan") == 0 && i + 1 < argc) {
             g_vcan_ifname = argv[++i];
-        } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
-            g_dump_path = argv[++i];
+        } else if (strcmp(argv[i], "--no-pace") == 0) {
+            g_paced = false;
         } else if (strcmp(argv[i], "--pace") == 0 && i + 1 < argc) {
             char *end = NULL;
-            g_pace_speed = strtod(argv[++i], &end);
-            if (end == argv[i] || *end || g_pace_speed < 0.0) {
-                fprintf(stderr, "linsightd: bad pace speed '%s'\n", argv[i]);
+            const double spd = strtod(argv[++i], &end);
+            if (end == argv[i] || *end || spd < 0.0) {
+                fprintf(stderr, TAG ": bad pace value '%s'\n", argv[i]);
                 return 1;
             }
-        } else if (strcmp(argv[i], "--pace-replay") == 0) {
-            g_pace_replay = true;
+            g_paced = (spd > 0.0);
         } else if (strcmp(argv[i], "--version") == 0) {
             printf("linsightd %s\n", LINSIGHT_HOST_VERSION);
             return 0;
         } else {
             fprintf(stderr,
                     "usage: linsightd [--port N] [--discovery-port N] [--vcan IFACE]\n"
-                    "                  [--dump PATH|-] [--pace SPEED] [--pace-replay]\n"
-                    "                  [--version]\n"
-                    "  --dump        candump text, device-timestamped ('-' = stdout)\n"
-                    "  --discovery-port N  UDP host-discovery port (default 8889, 0 disables)\n"
-                    "  --pace SPEED  vcan pacing: 0 = burst, >0 wall 1:1 (default 1.0);\n"
-                    "                SPEED scales intervals only with --pace-replay\n"
-                    "  --pace-replay replay historical gaps 1:1 instead of live wall time\n");
+                    "                 [--pace 0|1 | --no-pace] [--version]\n");
             return 1;
-        }
-    }
-
-    if (g_dump_path) {
-        if (strcmp(g_dump_path, "-") == 0) {
-            g_dump = stdout;
-        } else {
-            g_dump = fopen(g_dump_path, "w");
-            if (!g_dump) {
-                fprintf(stderr, TAG ": dump %s: %s\n", g_dump_path, strerror(errno));
-                return 1;
-            }
         }
     }
 
@@ -656,10 +657,6 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-    /* Always initialize the pacer: pace_count()/pace_new_session() run even
-     * without --vcan (stats line, session bookkeeping). */
-    pace_reset(&g_pace, g_pace_replay ? PACE_ANCHOR_FIRST : PACE_ANCHOR_WALL,
-               g_pace_speed);
 
     sigset_t mask;
     sigemptyset(&mask);
@@ -667,12 +664,13 @@ int main(int argc, char **argv)
     sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGPIPE);
     sigprocmask(SIG_BLOCK, &mask, NULL);
-    /* Nonblocking: the drain loops below must never block the main loop. */
     const int sigfd = signalfd(-1, &mask, SFD_NONBLOCK);
-
     const int tcp_fd = make_tcp_listener(g_port);
-    if (tcp_fd < 0 || sigfd < 0) {
-        fprintf(stderr, TAG ": listener setup failed: %s\n", strerror(errno));
+    const int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    g_epoll = epoll_create1(0);
+
+    if (tcp_fd < 0 || sigfd < 0 || tfd < 0 || g_epoll < 0) {
+        fprintf(stderr, TAG ": initialization failed: %s\n", strerror(errno));
         return 1;
     }
 
@@ -680,122 +678,91 @@ int main(int argc, char **argv)
         g_discovery_fd = make_discovery_socket(g_discovery_port);
     }
 
-    g_epoll = epoll_create1(0);
     linsight_parser_init(&g_dev.parser, g_dev.payload, LINSIGHT_MAX_CAN_BATCH);
-    if (g_epoll < 0) {
-        fprintf(stderr, TAG ": epoll_create1 failed: %s\n", strerror(errno));
-        return 1;
-    }
 
-    struct epoll_event ev = {0}; /* zero-init: u64 tags must not carry stack garbage */
-    ev.events = EPOLLIN;
-    ev.data.u64 = 1; /* tcp listener */
+    struct epoll_event ev = {.events = EPOLLIN, .data.u64 = EPOLL_TAG_TCP_LISTEN};
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, tcp_fd, &ev);
-    ev.data.u64 = 3; /* signalfd */
+    ev.data.u64 = EPOLL_TAG_SIGNAL;
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, sigfd, &ev);
     if (g_discovery_fd >= 0) {
-        ev.data.u64 = 2; /* UDP discovery */
+        ev.data.u64 = EPOLL_TAG_DISCOVERY;
         epoll_ctl(g_epoll, EPOLL_CTL_ADD, g_discovery_fd, &ev);
     }
 
-    const int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
-    if (tfd < 0) {
-        fprintf(stderr, TAG ": timerfd_create failed: %s\n", strerror(errno));
-        return 1;
-    }
     struct itimerspec its = {
         .it_interval = {.tv_sec = 1},
         .it_value = {.tv_sec = 1},
     };
     timerfd_settime(tfd, 0, &its, NULL);
-    ev.data.u64 = 4; /* timer */
+    ev.data.u64 = EPOLL_TAG_TIMER;
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, tfd, &ev);
 
     fprintf(stderr, TAG ": listening on :%s", g_port);
     if (g_discovery_fd >= 0) {
         fprintf(stderr, ", discovery udp :%d", g_discovery_port);
-    } else if (g_discovery_port == 0) {
-        fprintf(stderr, ", discovery disabled");
-    } else {
-        fprintf(stderr, ", discovery unavailable");
     }
     if (g_vcan_fd >= 0) {
-        fprintf(stderr, ", forwarding to SocketCAN %s (%s)", g_vcan_ifname,
-                g_pace_speed > 0.0
-                    ? (g_pace_replay ? "paced replay" : "paced wall 1:1")
-                    : "burst");
-    }
-    if (g_dump) {
-        fprintf(stderr, ", dumping candump to %s",
-                g_dump == stdout ? "stdout" : g_dump_path);
+        fprintf(stderr, ", SocketCAN %s (%s)", g_vcan_ifname,
+                g_paced ? "paced 1:1" : "burst");
     }
     fprintf(stderr, "\n");
 
     uint64_t last_recs = 0;
     while (!g_stop) {
         const int timeout =
-            (g_vcan_fd >= 0 && g_pace_speed > 0.0) ? pace_epoll_timeout_ms(&g_pace, mono_ns())
-                                                   : -1;
+            (g_vcan_fd >= 0 && g_paced) ? pace_epoll_timeout_ms(&g_pace, mono_ns()) : -1;
         struct epoll_event events[MAX_EVENTS];
         const int n = epoll_wait(g_epoll, events, MAX_EVENTS, timeout);
         for (int i = 0; i < n; i++) {
-            const uint64_t tag = events[i].data.u64;
-
-            if (tag == 3) { /* signal */
+            switch (events[i].data.u64) {
+            case EPOLL_TAG_SIGNAL: {
                 struct signalfd_siginfo si;
                 while (read(sigfd, &si, sizeof(si)) == sizeof(si)) {
                     g_stop = 1;
                 }
-            } else if (tag == 4) { /* 1 Hz stats */
+                break;
+            }
+            case EPOLL_TAG_TIMER: {
                 uint64_t misses;
                 while (read(tfd, &misses, sizeof(misses)) == sizeof(misses)) {
                 }
-                /* Idle watchdog: the device pings every 5 s; a silent session
-                 * for IDLE_TIMEOUT_MS is a dead link (e.g. lost Wi-Fi). */
                 if (g_dev.fd >= 0 && g_dev.last_rx &&
-                    time(NULL) - g_dev.last_rx > IDLE_TIMEOUT_MS / 1000u) {
-                    fprintf(stderr, TAG ": device idle > %us, closing\n",
-                            (unsigned)(IDLE_TIMEOUT_MS / 1000u));
+                    time(NULL) - g_dev.last_rx > IDLE_TIMEOUT_SEC) {
+                    fprintf(stderr, TAG ": device idle > %ds, closing\n", IDLE_TIMEOUT_SEC);
                     device_close();
                 }
-                if (g_dump) {
-                    fflush(g_dump);
-                }
-                /* A reconnect resets g_dev.recs; report just the new session
-                 * instead of underflowing the delta. */
                 const uint64_t delta =
                     g_dev.recs >= last_recs ? g_dev.recs - last_recs : g_dev.recs;
                 fprintf(stderr,
-                        TAG ": recs=%llu (+%llu) dump=%llu vcan=%llu vcan_dropped=%llu paceq=%u\n",
+                        TAG ": recs=%llu (+%llu) vcan=%llu vcan_dropped=%llu paceq=%u\n",
                         (unsigned long long)g_dev.recs, (unsigned long long)delta,
-                        (unsigned long long)g_dump_lines,
                         (unsigned long long)g_vcan_written,
-                        (unsigned long long)g_vcan_dropped,
-                        (unsigned)pace_count(&g_pace));
+                        (unsigned long long)g_vcan_dropped, (unsigned)g_pace.count);
                 last_recs = g_dev.recs;
-            } else if (tag == 2) { /* UDP discovery */
+                break;
+            }
+            case EPOLL_TAG_DISCOVERY:
                 discovery_handle(g_discovery_fd);
-            } else if (tag == 1) {
+                break;
+            case EPOLL_TAG_TCP_LISTEN:
                 device_accept(tcp_fd);
-            } else if (tag == 0) { /* device socket */
+                break;
+            case EPOLL_TAG_DEVICE: {
                 const uint32_t revents = events[i].events;
                 if (revents & EPOLLOUT) {
                     device_flush();
                 }
-                if (g_dev.fd < 0) {
-                    continue;
-                }
-                if (!(revents & (EPOLLIN | EPOLLERR | EPOLLHUP))) {
-                    continue;
+                if (g_dev.fd < 0 || !(revents & (EPOLLIN | EPOLLERR | EPOLLHUP))) {
+                    break;
                 }
                 uint8_t rx[RX_BUF_SIZE];
                 const ssize_t got = recv(g_dev.fd, rx, sizeof(rx), 0);
                 if (got <= 0) {
                     if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                        continue;
+                        break;
                     }
                     device_close();
-                    continue;
+                    break;
                 }
                 g_dev.last_rx = time(NULL);
                 if (linsight_parser_feed(&g_dev.parser, rx, (size_t)got, handle_frame,
@@ -803,36 +770,31 @@ int main(int argc, char **argv)
                     fprintf(stderr, TAG ": protocol error, closing device\n");
                     device_close();
                 }
+                break;
+            }
             }
         }
         pace_pump();
     }
 
     device_close();
-    if (g_vcan_fd >= 0 && g_pace_speed > 0.0) {
-        /* Drain whatever is queued: targets are in the past by now, burst. */
+    if (g_vcan_fd >= 0 && g_paced) {
         static linsight_can_record_t out[256];
         uint32_t got;
-        while ((got = pace_pop_due(&g_pace, UINT64_MAX, out,
-                                  (uint32_t)(sizeof(out) / sizeof(out[0])))) > 0) {
+        while ((got = pace_pop_due(&g_pace, UINT64_MAX, out, 256u)) > 0) {
             vcan_forward(out, got);
-        }
-    }
-    if (g_dump) {
-        fflush(g_dump);
-        if (g_dump != stdout) {
-            fclose(g_dump);
         }
     }
     if (g_vcan_fd >= 0) {
         close(g_vcan_fd);
-        g_vcan_fd = -1;
     }
     if (g_discovery_fd >= 0) {
         close(g_discovery_fd);
-        g_discovery_fd = -1;
     }
     close(tcp_fd);
+    close(tfd);
+    close(sigfd);
+    close(g_epoll);
     fprintf(stderr, TAG ": exited cleanly\n");
     return 0;
 }

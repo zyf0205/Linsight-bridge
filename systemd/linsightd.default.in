@@ -1,7 +1,6 @@
 # Arguments for linsightd.service (read by EnvironmentFile=-@CMAKE_INSTALL_FULL_SYSCONFDIR@/default/linsightd).
 # --vcan vcan0 forwards accepted records to SocketCAN (needs CAP_NET_RAW);
 # vcan0 is created at boot by vcan0.service.
-# Add --dump /path/to/cap.log (or --dump -) for a candump text stream.
-# --pace SPEED / --pace-replay control vcan pacing (see linsightd --help).
+# --no-pace (or --pace 0) disables 1:1 monotonic wall pacing (burst forward).
 # Discovery listens on UDP 8889 by default; add --discovery-port 0 to disable.
 LINSIGHTD_ARGS=--port 8888 --vcan vcan0

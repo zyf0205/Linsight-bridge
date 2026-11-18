@@ -4,13 +4,14 @@ This file provides guidance to Claude Code when working in the WSL Linux host re
 
 ## Repository state
 
-LinSight Linux host: `linsightd`, a thin epoll bridge (TCP device session ->
-dedupe -> paced SocketCAN forward / candump `--dump`). The ESP32-S3 firmware,
-Wi-Fi credentials, and flashing live in the separate Windows checkout
-`D:\_study\projects\_MyProject\LinSight`; this repo does not build firmware.
+LinSight Linux host: `linsightd`, a single-file Linux `epoll` bridge (`src/main.c`:
+TCP device session -> reconnect dedupe -> `CLOCK_MONOTONIC` 1:1 paced SocketCAN
+forward). The ESP32-S3 firmware, Wi-Fi credentials, and flashing live in the
+separate Windows checkout `D:\_study\projects\_MyProject\LinSight`; this repo
+does not build firmware.
 
 Layout:
-- `src/` — bridge daemon (main.c, session dedupe, pace scheduler)
+- `src/main.c` — single-file bridge daemon (epoll loop, session dedupe, monotonic pacer, SocketCAN forwarder)
 - `systemd/` — `linsightd.service`, `vcan0.service` + args template (CMake `install` targets)
 - `protocol/` — shared v2.1 parser (mirror of the firmware repo)
 - `README.md` — build, usage and service reference (the hardware doc lives in the firmware repo)
@@ -21,8 +22,7 @@ Layout:
 cd ~/linsight
 cmake -S . -B build && cmake --build build -j$(nproc)
 
-sudo ./build/linsightd --port 8888 --vcan vcan0 [--dump cap.log|-] \
-                        [--pace SPEED] [--pace-replay]
+sudo ./build/linsightd --port 8888 --vcan vcan0 [--no-pace | --pace 0|1]
 
 sudo cmake --install build        # linsightd + both units + prefix etc/default
 sudo systemctl daemon-reload
@@ -34,36 +34,33 @@ SocketCAN: `--vcan vcan0` forwards accepted records to SocketCAN;
 creates the interface at boot; for a manual session use
 `sudo ip link add vcan0 type vcan && sudo ip link set vcan0 up`.
 
-Analysis belongs to ecosystem tools (SavvyCAN, Wireshark, PlotJuggler) fed via
-`--vcan` or `--dump` — do not re-grow an in-house decoder/GUI.
+Analysis and text logging belong to Linux ecosystem tools (`candump vcan0`,
+SavvyCAN, Wireshark, PlotJuggler) fed via SocketCAN — do not re-grow an
+in-house text formatter, decoder or GUI.
 
 ## Architecture
 
-- `linsightd` (single-threaded epoll): TCP listener for the device
-  (`INADDR_ANY`), UDP discovery responder (default `8889`, tag 2; replies to
-  `LINSIGHT?1` with the TCP port), signalfd, 1 Hz timerfd (idle watchdog +
-  stats line + `--dump` flush). One device session at a time; no writer
-  thread, no recording — the SD black box or tcpdump/SavvyCAN own capture.
+- `linsightd` (`src/main.c`, single-threaded `epoll`): TCP listener for the
+  device (`INADDR_ANY`), UDP discovery responder (default `8889`, replies to
+  `LINSIGHT?1` with `LINSIGHT!1 <port>\n`), `signalfd`, 1 Hz `timerfd` (30 s
+  idle watchdog + stderr stats line). One device session at a time.
 - Dedupe: `session_record_new` skips a reconnect backlog by `ts_ms`/`seq`
-  marks; marks survive a reconnect with the same boot count and clear on a
-  boot change. HELLO `uptime_ms` anchors device time once per boot; old
-  firmware falls back to the first record's timestamp.
-- `--vcan IFACE`: accepted records are paced onto SocketCAN as
-  `struct can_frame` (`CAN_EFF_FLAG`/`CAN_RTR_FLAG`/`CAN_ERR_FLAG` mapped)
-  at their device-timestamped wall times via `pace.c`: a 262144-entry
-  drop-oldest queue with absolute `CLOCK_MONOTONIC` targets. Late backlog
-  pops immediately (compression, never catch-up sleep). `--pace 0` = burst,
-  `--pace-replay` = 1:1 historical intervals. Per-iteration budget keeps
-  PONG latency bounded; drops are counted, never blocking the epoll loop.
-- `--dump PATH|-`: live candump text, flushed per batch; useful without root.
+  marks; marks survive a reconnect with the same `boot` count and clear on a
+  boot change. HELLO `uptime_ms` anchors device time onto `CLOCK_MONOTONIC`
+   directly (`anchor_mono_ns`, `anchor_dev_ms`); old firmware falls back to the
+  first record's timestamp.
+- `--vcan IFACE`: accepted records are paced onto SocketCAN (`PF_CAN`,
+  `SOCK_RAW`) as `struct can_frame` (`CAN_EFF_FLAG`/`CAN_RTR_FLAG`/`CAN_ERR_FLAG`
+  mapped) at their 1:1 `CLOCK_MONOTONIC` target times via a 262144-entry
+  drop-oldest ring. Late backlog (`target_ns <= now_ns`) pops immediately
+  without catch-up sleeps. `--no-pace` (or `--pace 0`) forwards immediately in
+  burst mode. Per-iteration budget (`4096` records or `5 ms`) keeps `PONG`
+  latency bounded.
 - `protocol/frame.c` is pure C (no IDF, no malloc); keep it allocation-free and fuzzable.
 - `systemd/vcan0.service` (oneshot) creates and brings up vcan0 before
   `linsightd.service`; the daemon unit uses `DynamicUser`,
   `ProtectSystem=strict`, `CAP_NET_RAW` and reads
   `<prefix>/etc/default/linsightd`.
-- Single device TCP client; the device pings every 5 s and a silent session
-  is closed after 30 s. On reconnect the device drains its PSRAM ring
-  backlog first (up to ~209k records) — the dedupe marks absorb it.
 
 ## Shared files
 

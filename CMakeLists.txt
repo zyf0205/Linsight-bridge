@@ -13,21 +13,14 @@ if(LINSIGHT_SANITIZE)
     add_link_options(-fsanitize=address,undefined)
 endif()
 
-# Shared host code: session dedupe and the v2.1 parser (no .lsc I/O —
-# the bridge never records).
-add_library(linsight_core STATIC
-    src/session.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/protocol/frame.c)
-target_include_directories(linsight_core PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+# linsightd: single-threaded epoll SocketCAN bridge + shared v2.1 parser
+add_executable(linsightd
+    src/main.c
+    protocol/frame.c)
+target_include_directories(linsightd PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
 
-# linsightd: single-threaded epoll bridge (paced vcan forward + --dump)
-add_executable(linsightd src/main.c src/pace.c)
-target_link_libraries(linsightd PRIVATE linsight_core rt)
-
-# Install: bridge binary + systemd units + prefix etc/default args. The vcan0
-# oneshot unit creates the virtual CAN interface before linsightd starts.
+# Install: bridge binary + systemd units + prefix etc/default args.
 include(GNUInstallDirs)
 install(TARGETS linsightd RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 configure_file(systemd/linsightd.service.in
