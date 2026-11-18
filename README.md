@@ -93,7 +93,7 @@ sudo systemctl restart linsightd
 ## 仓库结构
 
 ```text
-src/main.c  单文件 epoll 守护进程（TCP/UDP/signalfd/timerfd/SocketCAN、会话去重、单调时钟节流）
+src/        守护进程：main.c 事件循环，device/pacer/vcan/discovery/util 模块
 protocol/   共享 v2.1 解析器（与固件仓库同步）
 systemd/    linsightd.service、vcan0.service、参数模板
 ```

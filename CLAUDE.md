@@ -4,14 +4,19 @@ This file provides guidance to Claude Code when working in the WSL Linux host re
 
 ## Repository state
 
-LinSight Linux host: `linsightd`, a single-file Linux `epoll` bridge (`src/main.c`:
-TCP device session -> reconnect dedupe -> `CLOCK_MONOTONIC` 1:1 paced SocketCAN
-forward). The ESP32-S3 firmware, Wi-Fi credentials, and flashing live in the
-separate Windows checkout `D:\_study\projects\_MyProject\LinSight`; this repo
-does not build firmware.
+LinSight Linux host: `linsightd`, a Linux `epoll` bridge (module sources under
+`src/`: TCP device session -> reconnect dedupe -> `CLOCK_MONOTONIC` 1:1 paced
+SocketCAN forward). The ESP32-S3 firmware, Wi-Fi credentials, and flashing live
+in the separate Windows checkout `D:\_study\projects\_MyProject\LinSight`; this
+repo does not build firmware.
 
 Layout:
-- `src/main.c` — single-file bridge daemon (epoll loop, session dedupe, monotonic pacer, SocketCAN forwarder)
+- `src/main.c` — CLI parsing, epoll loop, signal/timer handling, TCP listener, lifecycle
+- `src/device.c` — device session, v2.1 frame dispatch, reconnect dedupe, PONG TX
+- `src/pacer.c` — `CLOCK_MONOTONIC` 1:1 pacing ring and pump
+- `src/vcan.c` — SocketCAN open/forward/stats
+- `src/discovery.c` — UDP discovery responder
+- `src/util.c` — nonblocking helper and monotonic clock
 - `systemd/` — `linsightd.service`, `vcan0.service` + args template (CMake `install` targets)
 - `protocol/` — shared v2.1 parser (mirror of the firmware repo)
 - `README.md` — build, usage and service reference (the hardware doc lives in the firmware repo)
@@ -40,7 +45,7 @@ in-house text formatter, decoder or GUI.
 
 ## Architecture
 
-- `linsightd` (`src/main.c`, single-threaded `epoll`): TCP listener for the
+- `linsightd` (`src/`, single-threaded `epoll`): TCP listener for the
   device (`INADDR_ANY`), UDP discovery responder (default `8889`, replies to
   `LINSIGHT?1` with `LINSIGHT!1 <port>\n`), `signalfd`, 1 Hz `timerfd` (30 s
   idle watchdog + stderr stats line). One device session at a time.

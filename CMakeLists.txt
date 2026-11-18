@@ -16,6 +16,11 @@ endif()
 # linsightd: single-threaded epoll SocketCAN bridge + shared v2.1 parser
 add_executable(linsightd
     src/main.c
+    src/device.c
+    src/pacer.c
+    src/vcan.c
+    src/discovery.c
+    src/util.c
     protocol/frame.c)
 target_include_directories(linsightd PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
